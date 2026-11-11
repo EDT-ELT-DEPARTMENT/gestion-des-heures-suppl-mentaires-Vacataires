@@ -314,11 +314,23 @@ def remplir_fiche(ws, nom_vacataire, seances, dict_arabe, date_debut,
         if nettoyer_texte(x)
     })
     ws["A9"] = "المقياس المدرس : " + " // ".join(matieres)
-    types = sorted({
-        nettoyer_texte(x).split("-", 1)[0]
-        for x in matieres if nettoyer_texte(x)
-    })
-    ws["D9"] = "نوع التدريس : " + "+".join(types)
+    # نوع التدريس : afficher uniquement les catégories réellement enseignées.
+    # L'ordre est toujours Cours + TD + TP et aucun nom (français ou arabe)
+    # ne doit être ajouté dans ce champ.
+    types_presents = {
+        type_enseignement(x)
+        for x in seances["Enseignements"].tolist()
+        if type_enseignement(x)
+    }
+    types_ordre = [
+        libelle for libelle, cle in (
+            ("Cours", "cours"),
+            ("TD", "td"),
+            ("TP", "tp"),
+        )
+        if cle in types_presents
+    ]
+    ws["D9"] = "نوع التدريس : " + "+".join(types_ordre)
 
     total_general = 0.0
     details = []

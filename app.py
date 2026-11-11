@@ -124,7 +124,7 @@ try:
         seances_vac = df_edt[df_edt["ENSEIGNANT_NORM"].apply(lambda x: nom_norm in x if x else False)]
 
     nb_seances = len(seances_vac)
-    total_heures_semaine = nb_seances * 1.5
+    total_heures_semaine_ref = nb_seances * 1.5
 
     st.subheader(f"👨‍🏫 Fiche Enseignant : {vacataire_select} ({nom_prenom_arabe if nom_prenom_arabe else 'Nom arabe non trouvé'})")
     
@@ -132,7 +132,7 @@ try:
     c1.metric("Nom en Arabe", nom_prenom_arabe if nom_prenom_arabe else "Non renseigné")
     c2.metric("Grade", row_vac.get("Grade", "Vacataire"))
     c3.metric("Séances par semaine", nb_seances)
-    c4.metric("Volume hebdo", f"{total_heures_semaine} H")
+    c4.metric("Volume hebdo", f"{total_heures_semaine_ref} H")
 
     st.markdown("### 📅 Séances hebdomadaires de l'Emploi du Temps (S1)")
     st.dataframe(seances_vac[["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]], use_container_width=True)
@@ -155,6 +155,7 @@ try:
         ws['A9'] = f"المقياس المدرس : {modules_list[:120]}"
         ws['D9'] = f"نوع التدريس : C+TD+TP"
 
+        # Jours fériés officiels en Algérie
         jours_feries = [
             date(2026, 11, 1), # 1er Novembre
             date(2027, 5, 1),  # 1er Mai
@@ -180,23 +181,27 @@ try:
                 cell_hrs = ws.cell(row=wr, column=2)
                 txt_date = str(cell_date).strip() if cell_date else ""
 
+                # Extraction des jours mentionnés dans la ligne (ex: "7-8-9" -> [7, 8, 9])
                 jours_str = re.findall(r'\d+', txt_date)
 
-                if jours_str:
-                    jours_travailles_cette_semaine = 0
+                if jours_str and "/" not in txt_date:
+                    jours_total_semaine = len(jours_str)
+                    jours_travailles_valides = 0
+
                     for j_str in jours_str:
                         j = int(j_str)
                         try:
                             d_courante = date(annee_m, mois_m, j)
+                            # Vérification rigoureuse : >= date début, pas vendredi (4) ou samedi (5), pas jour férié
                             if d_courante >= date_debut_cours:
                                 if d_courante.weekday() not in [4, 5] and d_courante not in jours_feries:
-                                    jours_travailles_cette_semaine += 1
+                                    jours_travailles_valides += 1
                         except ValueError:
                             continue
 
-                    heures_semaine = jours_travailles_cette_semaine * (total_heures_semaine / max(1, len(jours_str)))
-                    
-                    if heures_semaine > 0:
+                    # Calcul proportionnel basé strictement sur les jours réels travaillés
+                    if jours_travailles_valides > 0 and jours_total_semaine > 0:
+                        heures_semaine = total_heures_semaine_ref * (jours_travailles_valides / jours_total_semaine)
                         cell_hrs.value = f"{round(heures_semaine, 1)}سا"
                         total_mois += heures_semaine
                     else:

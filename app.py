@@ -9,6 +9,7 @@ de chaque mois (pas sur une proratisation du volume hebdomadaire).
 import io
 import re
 import calendar
+import copy
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -376,6 +377,8 @@ def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, exclusions_par
     wb = openpyxl.load_workbook(FICHIER_TEMPLATE)
     nom_feuille = "Nom & prénom" if "Nom & prénom" in wb.sheetnames else wb.sheetnames[0]
     ws = wb[nom_feuille]
+    # Conserver le sens droite-à-gauche du modèle officiel.
+    ws.sheet_view.rightToLeft = True
     for autre_feuille in list(wb.sheetnames):
         if autre_feuille != nom_feuille:
             del wb[autre_feuille]
@@ -483,8 +486,29 @@ def generer_excel_groupe(df_vacataires, df_edt, liste_enseignants, dict_arabe,
     fiches = [(premier_nom, premieres_seances, modele)]
     for nom, seances, nom_onglet in enseignants[1:]:
         copie = wb.copy_worksheet(modele)
+
+        # openpyxl ne recopie pas tous les paramètres de présentation d'une
+        # feuille. En particulier, le sens droite-à-gauche du modèle officiel
+        # peut être perdu lors de copy_worksheet(). On recopie donc explicitement
+        # les paramètres d'affichage et de mise en page du modèle individuel.
+        # sheet_view est une propriété sans setter : recopier ses attributs utiles.
+        copie.sheet_view.rightToLeft = modele.sheet_view.rightToLeft
+        copie.sheet_view.showGridLines = modele.sheet_view.showGridLines
+        copie.sheet_view.zoomScale = modele.sheet_view.zoomScale
+        copie.sheet_properties = copy.copy(modele.sheet_properties)
+        copie.page_margins = copy.copy(modele.page_margins)
+        copie.page_setup = copy.copy(modele.page_setup)
+        copie.print_options = copy.copy(modele.print_options)
+        copie.sheet_format = copy.copy(modele.sheet_format)
+        copie.freeze_panes = modele.freeze_panes
+        copie.sheet_view.rightToLeft = True
         copie.title = nom_onglet
         fiches.append((nom, seances, copie))
+
+    # Garantir le même rendu RTL sur la première fiche et toutes les copies.
+    modele.sheet_view.rightToLeft = True
+    for _, _, feuille_fiche in fiches:
+        feuille_fiche.sheet_view.rightToLeft = True
 
     # Les feuilles d'index et de récap sont créées avant les fiches : déplacer
     # explicitement l'ordre pour garantir Index, Récapitulatif, puis fiches.

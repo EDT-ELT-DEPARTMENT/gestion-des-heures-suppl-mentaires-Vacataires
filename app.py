@@ -26,7 +26,8 @@ BASE_DIR = Path(__file__).resolve().parent
 FICHIER_PV = BASE_DIR / "Permanents-Vacataires-ELT2-2026-2027.xlsx"
 FICHIER_EDT = BASE_DIR / "dataEDT-ELT-S1-2027.xlsx"
 FICHIER_COORD = BASE_DIR / "Vos coordonnées en Arabe (réponses).xlsx"
-FICHIER_TEMPLATE = BASE_DIR / "Etats H.SUP VAC 2025-2026.xlsx"
+# Utilisation du nouveau fichier template mis à jour sur GitHub
+FICHIER_TEMPLATE = BASE_DIR / "Etat_HSUP_Vacataire_2026_2027.xlsx"
 
 def nettoyer_texte(valeur):
     if valeur is None or pd.isna(valeur):
@@ -47,7 +48,6 @@ def charger_donnees():
     # 1. Vacataires
     df_pv = pd.read_excel(FICHIER_PV, sheet_name="Permanents-Vacataires", dtype=str)
     df_pv.columns = [nettoyer_texte(c) for c in df_pv.columns]
-    # S'assurer que la colonne NOM et Qualité ne contiennent pas de NaN non convertis
     df_pv["NOM"] = df_pv["NOM"].fillna("").astype(str)
     df_pv["Qualité"] = df_pv["Qualité"].fillna("").astype(str)
     
@@ -88,7 +88,6 @@ def charger_donnees():
         if not seances.empty:
             vacataires_avec_charge.append(str(nom_v))
 
-    # Tri sécurisé en convertissant explicitement en chaînes de caractères (str)
     liste_triee = sorted(list(set([str(x) for x in vacataires_avec_charge if pd.notna(x) and str(x).strip()])))
     return df_vac, df_edt, dict_arabe, liste_triee
 
@@ -139,6 +138,10 @@ try:
     st.subheader("⚙️ Génération et Actualisation de l'État H.SUP (2026-2027)")
 
     if st.button("🚀 Générer l'état Excel officiel actualisé", type="primary", use_container_width=True):
+        if not FICHIER_TEMPLATE.exists():
+            st.error(f"Le fichier template '{FICHIER_TEMPLATE.name}' est introuvable sur le dépôt GitHub.")
+            st.stop()
+
         wb = openpyxl.load_workbook(FICHIER_TEMPLATE)
         ws = wb.active
 

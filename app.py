@@ -9,7 +9,7 @@ import pandas as pd
 import openpyxl
 import io
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 st.set_page_config(
@@ -45,7 +45,6 @@ def normaliser_nom(nom):
 
 @st.cache_data(show_spinner="Chargement et synchronisation des sources...")
 def charger_donnees():
-    # 1. Vacataires
     df_pv = pd.read_excel(FICHIER_PV, sheet_name="Permanents-Vacataires", dtype=str)
     df_pv.columns = [nettoyer_texte(c) for c in df_pv.columns]
     df_pv["NOM"] = df_pv["NOM"].fillna("").astype(str)
@@ -54,13 +53,11 @@ def charger_donnees():
     df_vac = df_pv[df_pv["Qualité"].str.strip().str.lower() == "vacataire"].copy()
     df_vac["NOM_NORM"] = df_vac["NOM"].apply(normaliser_nom)
 
-    # 2. EDT
     df_edt = pd.read_excel(FICHIER_EDT, sheet_name=0, dtype=str)
     df_edt.columns = [nettoyer_texte(c) for c in df_edt.columns]
     df_edt["Enseignants"] = df_edt["Enseignants"].fillna("").astype(str)
     df_edt["ENSEIGNANT_NORM"] = df_edt["Enseignants"].apply(normaliser_nom)
 
-    # 3. Coordonnées en arabe
     df_coord = pd.read_excel(FICHIER_COORD, dtype=str)
     df_coord.columns = [nettoyer_texte(c) for c in df_coord.columns]
     
@@ -74,7 +71,6 @@ def charger_donnees():
         if nom_fr:
             dict_arabe[normaliser_nom(nom_fr)] = nom_ar
 
-    # Filtrer les vacataires avec charge
     vacataires_avec_charge = []
     for _, vac_row in df_vac.iterrows():
         nom_v = vac_row["NOM"]
@@ -95,8 +91,6 @@ try:
     df_vacataires, df_edt, dict_noms_arabe, liste_vacataires_actifs = charger_donnees()
 
     st.sidebar.header("🔍 Paramètres & Sélection")
-    
-    # Choix de la date de début des enseignements
     date_debut_cours = st.sidebar.date_input("Date de début des enseignements", value=datetime(2026, 9, 13))
 
     if not liste_vacataires_actifs:
@@ -105,21 +99,18 @@ try:
 
     vacataire_select = st.sidebar.selectbox("Choisir un enseignant vacataire", liste_vacataires_actifs)
 
-    # Informations de l'enseignant
     row_vac = df_vacataires[df_vacataires["NOM"] == vacataire_select].iloc[0]
     nom_norm = normaliser_nom(vacataire_select)
     
-    # Recherche robuste du nom en arabe (correspondance exacte ou par mots clés)
     nom_prenom_arabe = dict_noms_arabe.get(nom_norm, "")
     if not nom_prenom_arabe:
         mots_v = set(nom_norm.split())
         for fr_key, ar_val in dict_noms_arabe.items():
             mots_k = set(fr_key.split())
-            if mots_v.intersection(mots_k) and len(mots_v.intersection(mots_k)) >= 1:
+            if mots_v.intersection(mots_k):
                 nom_prenom_arabe = ar_val
                 break
 
-    # Séparation du prénom et du nom en arabe
     parties_ar = nom_prenom_arabe.split()
     if len(parties_ar) >= 2:
         prenom_ar = parties_ar[0]
@@ -128,7 +119,6 @@ try:
         prenom_ar = nom_prenom_arabe
         nom_ar = ""
 
-    # Recherche des séances EDT
     seances_vac = df_edt[df_edt["ENSEIGNANT_NORM"] == nom_norm]
     if seances_vac.empty:
         seances_vac = df_edt[df_edt["ENSEIGNANT_NORM"].apply(lambda x: nom_norm in x if x else False)]
@@ -142,7 +132,7 @@ try:
     c1.metric("Nom en Arabe", nom_prenom_arabe if nom_prenom_arabe else "Non renseigné")
     c2.metric("Grade", row_vac.get("Grade", "Vacataire"))
     c3.metric("Séances par semaine", nb_seances)
-    c4.metric("Volume hebdo (1 séance = 1.5h)", f"{total_heures_semaine} H")
+    c4.metric("Volume hebdo", f"{total_heures_semaine} H")
 
     st.markdown("### 📅 Séances hebdomadaires de l'Emploi du Temps (S1)")
     st.dataframe(seances_vac[["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]], use_container_width=True)
@@ -160,18 +150,11 @@ try:
         ws['A7'] = f"الاسم : {prenom_ar}"
         ws['C7'] = f"اللقب : {nom_ar}"
         ws['A8'] = f"الرتبة : أستاذ مؤقت  "
-        ws['C8'] = f"الهيئة المستخدمة الاصلية  : الالكتروتقني  "
+        ws['C8'] = f"الهيئة المستخدمةالاصلية  : الالكتروتقني  "
         
         modules_list = " // ".join(seances_vac["Enseignements"].dropna().unique())
         ws['A9'] = f"المقياس المدرس : {modules_list[:120]}"
         ws['D9'] = f"نوع التدريس : C+TD+TP"
-
-        # Jours fériés officiels en Algérie (Ex: 1er Novembre)
-        jours_feries_algerie = [
-            datetime(2026, 11, 1), # 1er Novembre
-            datetime(2027, 7, 5),  # Fête de l'indépendance
-            datetime(2027, 5, 1),  # Fête du travail
-        ]
 
         mois_blocks = [
             {"weeks_rows": [12, 13, 14, 15, 16], "total_row": 17},
@@ -189,25 +172,20 @@ try:
                 cell_hrs = ws.cell(row=wr, column=2)
                 txt_date = str(cell_date).strip() if cell_date else ""
 
-                # Si la ligne contient des dates de séances actives
-                if re.search(r'\d+', txt_date):
-                    # Validation calendaire intelligente (exclure vendredi, samedi et jours fériés)
-                    # On applique le volume hebdomadaire calculé
+                # Ne remplir la cellule que si la ligne contient une semaine active avec des chiffres (dates)
+                if re.search(r'\d+', txt_date) and "/" not in txt_date:
                     cell_hrs.value = f"{total_heures_semaine}سا"
                     total_mois += total_heures_semaine
                 else:
-                    cell_hrs.value = "/"
+                    # Laisser la cellule vide si aucune semaine active / pas de cours
+                    cell_hrs.value = None
 
-            ws.cell(row=block["total_row"], column=2).value = f"{total_mois}سا"
+            # Total du mois (uniquement si supérieur à 0, sinon vide)
+            ws.cell(row=block["total_row"], column=2).value = f"{total_mois}سا" if total_mois > 0 else None
             total_general += total_mois
 
-        ws.cell(row=39, column=2).value = f"{total_general}سا"
-
-        # Nettoyage en dessous
-        for r in range(40, 48):
-            cell_c = ws.cell(row=r, column=2)
-            if cell_c.value and "مدير" not in str(cell_c.value):
-                cell_c.value = None
+        # Inscription stricte du total général à la ligne 39 exacte sans décalage
+        ws.cell(row=39, column=2).value = f"{total_general}سا" if total_general > 0 else None
 
         buffer = io.BytesIO()
         wb.save(buffer)

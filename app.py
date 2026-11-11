@@ -97,13 +97,13 @@ try:
     nom_prenom_arabe = dict_noms_arabe.get(nom_norm, "")
 
     # Séparation du nom et prénom en arabe
-parties_ar = nom_prenom_arabe.split()
-if len(parties_ar) >= 2:
-    prenom_ar = parties_ar[0]
-    nom_ar = " ".join(parties_ar[1:])
-else:
-    prenom_ar = nom_prenom_arabe
-    nom_ar = ""
+    parties_ar = nom_prenom_arabe.split()
+    if len(parties_ar) >= 2:
+        prenom_ar = parties_ar[0]
+        nom_ar = " ".join(parties_ar[1:])
+    else:
+        prenom_ar = nom_prenom_arabe
+        nom_ar = ""
 
     # Recherche des séances EDT
     seances_vac = df_edt[df_edt["ENSEIGNANT_NORM"] == nom_norm]
@@ -131,7 +131,7 @@ else:
         wb = openpyxl.load_workbook(FICHIER_TEMPLATE)
         ws = wb.active
 
-        # Inscription séparée du Nom et Prénom en Arabe selon le modèle requis (ex: A7, C7)
+        # Inscription séparée du Nom et Prénom en Arabe selon le modèle requis
         ws['A7'] = f"الاسم : {prenom_ar}"
         ws['C7'] = f"اللقب : {nom_ar}"
         ws['A8'] = f"الرتبة : أستاذ مؤقت"

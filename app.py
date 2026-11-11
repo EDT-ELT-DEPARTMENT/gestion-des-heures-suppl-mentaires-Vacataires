@@ -40,7 +40,7 @@ def normaliser_nom(nom):
     txt = re.sub(r'[^A-Z0-9 ]', '', txt)
     return re.sub(r'\s+', ' ', txt).strip()
 
-@st.cache_data(show_spinner="Chargement des sources de données...")
+@st.cache_data(show_spinner="Chargement et filtrage des données...")
 def charger_donnees():
     # 1. Vacataires
     df_pv = pd.read_excel(FICHIER_PV, sheet_name="Permanents-Vacataires", dtype=str)
@@ -57,7 +57,6 @@ def charger_donnees():
     df_coord = pd.read_excel(FICHIER_COORD, dtype=str)
     df_coord.columns = [nettoyer_texte(c) for c in df_coord.columns]
     
-    # Recherche colonne Nom français et arabe
     col_nom_fr = next((c for c in df_coord.columns if "francais" in c.lower() or "français" in c.lower()), df_coord.columns[2])
     col_nom_ar = next((c for c in df_coord.columns if "arabe" in c.lower()), df_coord.columns[3])
 
@@ -68,80 +67,90 @@ def charger_donnees():
         if nom_fr:
             dict_arabe[normaliser_nom(nom_fr)] = nom_ar
 
-    return df_vac, df_edt, dict_arabe
+    # Filtrer uniquement les vacataires qui ont une charge dans l'EDT
+    vacataires_avec_charge = []
+    for _, vac_row in df_vac.iterrows():
+        nom_v = vac_row["NOM"]
+        nom_n = vac_row["NOM_NORM"]
+        seances = df_edt[df_edt["ENSEIGNANT_NORM"] == nom_n]
+        if seances.empty:
+            seances = df_edt[df_edt["ENSEIGNANT_NORM"].apply(lambda x: nom_n in x if x else False)]
+        
+        if not seances.empty:
+            vacataires_avec_charge.append(nom_v)
+
+    return df_vac, df_edt, dict_arabe, sorted(list(set(vacataires_avec_charge)))
 
 try:
-    df_vacataires, df_edt, dict_noms_arabe = charger_donnees()
+    df_vacataires, df_edt, dict_noms_arabe, liste_vacataires_actifs = charger_donnees()
 
-    st.sidebar.header("🔍 Sélection des Vacataires")
-    liste_vacataires = sorted(df_vacataires["NOM"].dropna().unique())
-    vacataire_select = st.sidebar.selectbox("Choisir un enseignant vacataire", liste_vacataires)
+    st.sidebar.header("🔍 Sélection des Vacataires (Avec Charge)")
+    if not liste_vacataires_actifs:
+        st.error("Aucun enseignant vacataire avec une charge horaire n'a été trouvé dans l'EDT.")
+        st.stop()
+
+    vacataire_select = st.sidebar.selectbox("Choisir un enseignant vacataire", liste_vacataires_actifs)
 
     # Informations de l'enseignant
     row_vac = df_vacataires[df_vacataires["NOM"] == vacataire_select].iloc[0]
     nom_norm = normaliser_nom(vacataire_select)
-    nom_arabe = dict_noms_arabe.get(nom_norm, "غير متوفر")
+    nom_prenom_arabe = dict_noms_arabe.get(nom_norm, "")
+
+    # Séparation du nom et prénom en arabe
+parties_ar = nom_prenom_arabe.split()
+if len(parties_ar) >= 2:
+    prenom_ar = parties_ar[0]
+    nom_ar = " ".join(parties_ar[1:])
+else:
+    prenom_ar = nom_prenom_arabe
+    nom_ar = ""
 
     # Recherche des séances EDT
     seances_vac = df_edt[df_edt["ENSEIGNANT_NORM"] == nom_norm]
     if seances_vac.empty:
-        # Correspondance partielle
         seances_vac = df_edt[df_edt["ENSEIGNANT_NORM"].apply(lambda x: nom_norm in x if x else False)]
 
     nb_seances = len(seances_vac)
-    # Calcul de la charge selon la consigne : nb_seances * 1.5 heures par exemple
     total_heures_semaine = nb_seances * 1.5
 
-    st.subheader(f"👨‍🏫 Fiche Enseignant : {vacataire_select} ({nom_arabe})")
+    st.subheader(f"👨‍🏫 Fiche Enseignant : {vacataire_select} ({nom_prenom_arabe})")
     
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Nom en Arabe", nom_arabe)
+    c1.metric("Nom complet en Arabe", nom_prenom_arabe if nom_prenom_arabe else "Non renseigné")
     c2.metric("Grade", row_vac.get("Grade", "Vacataire"))
     c3.metric("Séances par semaine", nb_seances)
-    c4.metric("Volume horaire hebdomadaire", f"{total_heures_semaine} H")
+    c4.metric("Volume horaire hebdo", f"{total_heures_semaine} H")
 
     st.markdown("### 📅 Séances hebdomadaires de l'Emploi du Temps (S1)")
-    if not seances_vac.empty:
-        st.dataframe(seances_vac[["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]], use_container_width=True)
-    else:
-        st.warning("Aucune séance spécifique trouvée dans l'EDT pour cet enseignant.")
+    st.dataframe(seances_vac[["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]], use_container_width=True)
 
     st.divider()
     st.subheader("⚙️ Génération et Actualisation de l'État H.SUP (2026-2027)")
 
     if st.button("🚀 Générer l'état Excel officiel actualisé", type="primary", use_container_width=True):
-        # Chargement du fichier template
         wb = openpyxl.load_workbook(FICHIER_TEMPLATE)
         ws = wb.active
 
-        # 1. Mise à jour des informations de l'enseignant dans la feuille
-        # Extraction nom et prénom séparés si possible
-        parties_nom = vacataire_select.split(" ", 1)
-        prenom_val = parties_nom[0]
-        nom_famille_val = parties_nom[1] if len(parties_nom) > 1 else ""
-
-        # Inscription selon le modèle (Cellules adaptées du template)
-        ws['A7'] = f"الاسم :{prenom_val}"
-        ws['C7'] = f"اللقب :{nom_arabe if nom_arabe != 'غير متوفر' else nom_famille_val}"
-        ws['A8'] = f"الرتبة :أستاذ مؤقت"
-        ws['C8'] = f"الهيئة المستخدمةالاصلية  :الالكتروتقني"
+        # Inscription séparée du Nom et Prénom en Arabe selon le modèle requis (ex: A7, C7)
+        ws['A7'] = f"الاسم : {prenom_ar}"
+        ws['C7'] = f"اللقب : {nom_ar}"
+        ws['A8'] = f"الرتبة : أستاذ مؤقت"
+        ws['C8'] = f"الهيئة المستخدمة الاصلية : الالكتروتقني"
         
         # Modules enseignés
         modules_list = " // ".join(seances_vac["Enseignements"].dropna().unique())
-        ws['A9'] = f"المقياس المدرس :{modules_list[:100]}"
-        ws['D9'] = f"نوع التدريس :C+TD+TP"
+        ws['A9'] = f"المقياس المدرس : {modules_list[:120]}"
+        ws['D9'] = f"نوع التدريس : C+TD+TP"
 
-        # 2. Mise à jour de l'année universitaire à 2026-2027 et nettoyage des anciennes valeurs fictives
-        # Effacement du contenu des heures de l'ancien modèle pour le remplir proprement par les calculs actuels
+        # Nettoyage des anciennes valeurs et mise en place des nouveaux volumes horaires calculés
         for r in range(11, 40):
             for col in ['B', 'C', 'D']:
                 cell = ws[f'{col}{r}']
-                # Si ce n'est pas une ligne de total, on nettoie ou adapte
-                if "المجموع" not in str(cell.value):
-                    if col == 'B' and r % 6 != 5: # Exemple de nettoyage des cellules d'heures
-                        cell.value = f"{total_heures_semaine}سا" if nb_seances > 0 else "/"
+                if cell.value and "المجموع" in str(cell.value):
+                    continue
+                if col == 'B':
+                    cell.value = f"{total_heures_semaine}سا"
 
-        # Sauvegarde dans un buffer mémoire
         buffer = io.BytesIO()
         wb.save(buffer)
         buffer.seek(0)
@@ -159,4 +168,4 @@ try:
         )
 
 except Exception as e:
-    st.error(f"Une erreur est survenue lors du traitement des fichiers sources : {e}")
+    st.error(f"Une erreur est survenue lors du traitement : {e}")

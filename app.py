@@ -9,7 +9,7 @@ import pandas as pd
 import openpyxl
 import io
 import re
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from pathlib import Path
 
 st.set_page_config(
@@ -123,17 +123,16 @@ try:
     if seances_vac.empty:
         seances_vac = df_edt[df_edt["ENSEIGNANT_NORM"].apply(lambda x: nom_norm in x if x else False)]
 
-    nb_seances_hebdo_edt = len(seances_vac)
-    # Volume par séance (ex: 1.5h si réparti) ou base de calcul
-    duree_seance = 1.5
+    nb_seances = len(seances_vac)
+    total_heures_semaine = nb_seances * 1.5
 
     st.subheader(f"👨‍🏫 Fiche Enseignant : {vacataire_select} ({nom_prenom_arabe if nom_prenom_arabe else 'Nom arabe non trouvé'})")
     
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Nom en Arabe", nom_prenom_arabe if nom_prenom_arabe else "Non renseigné")
     c2.metric("Grade", row_vac.get("Grade", "Vacataire"))
-    c3.metric("Séances EDT par semaine", nb_seances_hebdo_edt)
-    c4.metric("Volume hebdo total", f"{nb_seances_hebdo_edt * duree_seance} H")
+    c3.metric("Séances par semaine", nb_seances)
+    c4.metric("Volume hebdo", f"{total_heures_semaine} H")
 
     st.markdown("### 📅 Séances hebdomadaires de l'Emploi du Temps (S1)")
     st.dataframe(seances_vac[["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]], use_container_width=True)
@@ -147,7 +146,6 @@ try:
         wb = openpyxl.load_workbook(fichier_a_ouvrir)
         ws = wb.active
 
-        # Inscription séparée du Prénom et Nom en Arabe
         ws['A7'] = f"الاسم : {prenom_ar}"
         ws['C7'] = f"اللقب : {nom_ar}"
         ws['A8'] = f"الرتبة : أستاذ مؤقت  "
@@ -157,7 +155,6 @@ try:
         ws['A9'] = f"المقياس المدرس : {modules_list[:120]}"
         ws['D9'] = f"نوع التدريس : C+TD+TP"
 
-        # Jours fériés officiels en Algérie
         jours_feries = [
             date(2026, 11, 1), # 1er Novembre
             date(2027, 5, 1),  # 1er Mai
@@ -183,7 +180,6 @@ try:
                 cell_hrs = ws.cell(row=wr, column=2)
                 txt_date = str(cell_date).strip() if cell_date else ""
 
-                # Extraction de tous les numéros de jours mentionnés dans la semaine (ex: "7-8-9" -> [7, 8, 9])
                 jours_str = re.findall(r'\d+', txt_date)
 
                 if jours_str:
@@ -192,15 +188,12 @@ try:
                         j = int(j_str)
                         try:
                             d_courante = date(annee_m, mois_m, j)
-                            # Vérification : >= date début, pas vendredi (4), pas samedi (5), pas jour férié
                             if d_courante >= date_debut_cours:
                                 if d_courante.weekday() not in [4, 5] and d_courante not in jours_feries:
                                     jours_travailles_cette_semaine += 1
                         except ValueError:
                             continue
 
-                    # Calcul des heures pour cette semaine en fonction des jours réellement travaillés
-                    # Si par exemple il y a 2 jours valides sur 3 dans la semaine
                     heures_semaine = jours_travailles_cette_semaine * (total_heures_semaine / max(1, len(jours_str)))
                     
                     if heures_semaine > 0:

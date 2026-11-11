@@ -91,7 +91,7 @@ try:
     df_vacataires, df_edt, dict_noms_arabe, liste_vacataires_actifs = charger_donnees()
 
     st.sidebar.header("🔍 Paramètres & Calendrier")
-    date_debut_cours = st.sidebar.date_input("Date de début des enseignements", value=date(2026, 9, 13))
+    date_debut_cours = st.sidebar.date_input("Date de début des enseignements", value=date(2026, 9, 23))
 
     if not liste_vacataires_actifs:
         st.error("Aucun enseignant vacataire avec une charge horaire n'a été trouvé dans l'EDT.")
@@ -121,7 +121,7 @@ try:
 
     seances_vac = df_edt[df_edt["ENSEIGNANT_NORM"] == nom_norm]
     if seances_vac.empty:
-        seances_vac = df_edt[df_edt["ENSEIGNANT_NORM"].apply(lambda x: nom_norm in x if x else False)]
+        seances_vac = df_edt[df_edt["ENSEIGNANT_NORM"].apply(lambda x: nom_n in x if x else False)]
 
     nb_seances = len(seances_vac)
     total_heures_semaine_ref = nb_seances * 1.5
@@ -132,7 +132,7 @@ try:
     c1.metric("Nom en Arabe", nom_prenom_arabe if nom_prenom_arabe else "Non renseigné")
     c2.metric("Grade", row_vac.get("Grade", "Vacataire"))
     c3.metric("Séances par semaine", nb_seances)
-    c4.metric("Volume hebdo", f"{total_heures_semaine_ref} H")
+    c4.metric("Volume hebdo ref", f"{total_heures_semaine_ref} H")
 
     st.markdown("### 📅 Séances hebdomadaires de l'Emploi du Temps (S1)")
     st.dataframe(seances_vac[["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]], use_container_width=True)
@@ -181,10 +181,16 @@ try:
                 cell_hrs = ws.cell(row=wr, column=2)
                 txt_date = str(cell_date).strip() if cell_date else ""
 
-                # Extraction des jours mentionnés dans la ligne (ex: "7-8-9" -> [7, 8, 9])
-                jours_str = re.findall(r'\d+', txt_date)
+                # Extraction stricte de la partie APRÈS les deux-points ':' (ex: "الاسبوع 2 :7-8-9" -> "7-8-9")
+                if ":" in txt_date:
+                    partie_jours = txt_date.split(":")[-1].strip()
+                else:
+                    partie_jours = txt_date
 
-                if jours_str and "/" not in txt_date:
+                # Récupération uniquement des chiffres de jours dans cette partie
+                jours_str = re.findall(r'\d+', partie_jours)
+
+                if jours_str and "/" not in partie_jours:
                     jours_total_semaine = len(jours_str)
                     jours_travailles_valides = 0
 

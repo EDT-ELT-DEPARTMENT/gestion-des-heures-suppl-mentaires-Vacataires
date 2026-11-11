@@ -9,7 +9,7 @@ import pandas as pd
 import openpyxl
 import io
 import re
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 st.set_page_config(
@@ -90,8 +90,8 @@ def charger_donnees():
 try:
     df_vacataires, df_edt, dict_noms_arabe, liste_vacataires_actifs = charger_donnees()
 
-    st.sidebar.header("🔍 Paramètres & Sélection")
-    date_debut_cours = st.sidebar.date_input("Date de début des enseignements", value=datetime(2026, 9, 13))
+    st.sidebar.header("🔍 Paramètres & Calendrier")
+    date_debut_cours = st.sidebar.date_input("Date de début des enseignements", value=date(2026, 9, 13))
 
     if not liste_vacataires_actifs:
         st.error("Aucun enseignant vacataire avec une charge horaire n'a été trouvé dans l'EDT.")
@@ -123,16 +123,17 @@ try:
     if seances_vac.empty:
         seances_vac = df_edt[df_edt["ENSEIGNANT_NORM"].apply(lambda x: nom_norm in x if x else False)]
 
-    nb_seances = len(seances_vac)
-    total_heures_semaine = nb_seances * 1.5
+    nb_seances_hebdo_edt = len(seances_vac)
+    # Volume par séance (ex: 1.5h si réparti) ou base de calcul
+    duree_seance = 1.5
 
     st.subheader(f"👨‍🏫 Fiche Enseignant : {vacataire_select} ({nom_prenom_arabe if nom_prenom_arabe else 'Nom arabe non trouvé'})")
     
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Nom en Arabe", nom_prenom_arabe if nom_prenom_arabe else "Non renseigné")
     c2.metric("Grade", row_vac.get("Grade", "Vacataire"))
-    c3.metric("Séances par semaine", nb_seances)
-    c4.metric("Volume hebdo", f"{total_heures_semaine} H")
+    c3.metric("Séances EDT par semaine", nb_seances_hebdo_edt)
+    c4.metric("Volume hebdo total", f"{nb_seances_hebdo_edt * duree_seance} H")
 
     st.markdown("### 📅 Séances hebdomadaires de l'Emploi du Temps (S1)")
     st.dataframe(seances_vac[["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]], use_container_width=True)
@@ -156,36 +157,64 @@ try:
         ws['A9'] = f"المقياس المدرس : {modules_list[:120]}"
         ws['D9'] = f"نوع التدريس : C+TD+TP"
 
+        # Jours fériés officiels en Algérie
+        jours_feries = [
+            date(2026, 11, 1), # 1er Novembre
+            date(2027, 5, 1),  # 1er Mai
+            date(2027, 7, 5),  # Fête de l'Indépendance
+        ]
+
         mois_blocks = [
-            {"weeks_rows": [12, 13, 14, 15, 16], "total_row": 17},
-            {"weeks_rows": [19, 20, 21, 22, 23], "total_row": 24},
-            {"weeks_rows": [26, 27, 28, 29, 30], "total_row": 31},
-            {"weeks_rows": [33, 34, 35, 36, 37], "total_row": 38},
+            {"weeks_rows": [12, 13, 14, 15, 16], "total_row": 17, "annee": 2026, "mois_num": 9},   # Septembre
+            {"weeks_rows": [19, 20, 21, 22, 23], "total_row": 24, "annee": 2026, "mois_num": 10},  # Octobre
+            {"weeks_rows": [26, 27, 28, 29, 30], "total_row": 31, "annee": 2026, "mois_num": 11},  # Novembre
+            {"weeks_rows": [33, 34, 35, 36, 37], "total_row": 38, "annee": 2026, "mois_num": 12},  # Décembre
         ]
 
         total_general = 0.0
 
         for block in mois_blocks:
             total_mois = 0.0
+            annee_m = block["annee"]
+            mois_m = block["mois_num"]
+
             for wr in block["weeks_rows"]:
                 cell_date = ws.cell(row=wr, column=1).value
                 cell_hrs = ws.cell(row=wr, column=2)
                 txt_date = str(cell_date).strip() if cell_date else ""
 
-                # Ne remplir la cellule que si la ligne contient une semaine active avec des chiffres (dates)
-                if re.search(r'\d+', txt_date) and "/" not in txt_date:
-                    cell_hrs.value = f"{total_heures_semaine}سا"
-                    total_mois += total_heures_semaine
+                # Extraction de tous les numéros de jours mentionnés dans la semaine (ex: "7-8-9" -> [7, 8, 9])
+                jours_str = re.findall(r'\d+', txt_date)
+
+                if jours_str:
+                    jours_travailles_cette_semaine = 0
+                    for j_str in jours_str:
+                        j = int(j_str)
+                        try:
+                            d_courante = date(annee_m, mois_m, j)
+                            # Vérification : >= date début, pas vendredi (4), pas samedi (5), pas jour férié
+                            if d_courante >= date_debut_cours:
+                                if d_courante.weekday() not in [4, 5] and d_courante not in jours_feries:
+                                    jours_travailles_cette_semaine += 1
+                        except ValueError:
+                            continue
+
+                    # Calcul des heures pour cette semaine en fonction des jours réellement travaillés
+                    # Si par exemple il y a 2 jours valides sur 3 dans la semaine
+                    heures_semaine = jours_travailles_cette_semaine * (total_heures_semaine / max(1, len(jours_str)))
+                    
+                    if heures_semaine > 0:
+                        cell_hrs.value = f"{round(heures_semaine, 1)}سا"
+                        total_mois += heures_semaine
+                    else:
+                        cell_hrs.value = None
                 else:
-                    # Laisser la cellule vide si aucune semaine active / pas de cours
                     cell_hrs.value = None
 
-            # Total du mois (uniquement si supérieur à 0, sinon vide)
-            ws.cell(row=block["total_row"], column=2).value = f"{total_mois}سا" if total_mois > 0 else None
+            ws.cell(row=block["total_row"], column=2).value = f"{round(total_mois, 1)}سا" if total_mois > 0 else None
             total_general += total_mois
 
-        # Inscription stricte du total général à la ligne 39 exacte sans décalage
-        ws.cell(row=39, column=2).value = f"{total_general}سا" if total_general > 0 else None
+        ws.cell(row=39, column=2).value = f"{round(total_general, 1)}سا" if total_general > 0 else None
 
         buffer = io.BytesIO()
         wb.save(buffer)
@@ -194,7 +223,7 @@ try:
         nom_fichier_clean = normaliser_nom(vacataire_select).replace(" ", "_")
         file_name = f"Etat_HSUP_Vacataire_{nom_fichier_clean}_2026_2027.xlsx"
 
-        st.success(f"✅ Fichier d'état Excel généré avec succès ! (Total général : {total_general} H)")
+        st.success(f"✅ Fichier d'état Excel généré avec succès ! (Total général : {round(total_general, 1)} H)")
         st.download_button(
             label="📥 Télécharger l'état Excel actualisé",
             data=buffer,

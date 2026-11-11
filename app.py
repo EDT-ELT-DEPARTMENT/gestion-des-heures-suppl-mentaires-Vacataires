@@ -34,7 +34,9 @@ def nettoyer_texte(valeur):
     return re.sub(r'\s+', ' ', str(valeur)).strip()
 
 def normaliser_nom(nom):
-    txt = nettoyer_texte(nom).upper()
+    if nom is None or pd.isna(nom):
+        return ""
+    txt = str(nom).upper()
     for src, dst in [('É','E'), ('È','E'), ('Ê','E'), ('Ë','E'), ('À','A'), ('Â','A'), ('Ä','A'), ('Î','I'), ('Ï','I'), ('Ô','O'), ('Ö','O'), ('Ù','U'), ('Û','U'), ('Ü','U')]:
         txt = txt.replace(src, dst)
     txt = re.sub(r'[^A-Z0-9 ]', '', txt)
@@ -45,12 +47,17 @@ def charger_donnees():
     # 1. Vacataires
     df_pv = pd.read_excel(FICHIER_PV, sheet_name="Permanents-Vacataires", dtype=str)
     df_pv.columns = [nettoyer_texte(c) for c in df_pv.columns]
+    # S'assurer que la colonne NOM et Qualité ne contiennent pas de NaN non convertis
+    df_pv["NOM"] = df_pv["NOM"].fillna("").astype(str)
+    df_pv["Qualité"] = df_pv["Qualité"].fillna("").astype(str)
+    
     df_vac = df_pv[df_pv["Qualité"].str.strip().str.lower() == "vacataire"].copy()
     df_vac["NOM_NORM"] = df_vac["NOM"].apply(normaliser_nom)
 
     # 2. EDT
     df_edt = pd.read_excel(FICHIER_EDT, sheet_name=0, dtype=str)
     df_edt.columns = [nettoyer_texte(c) for c in df_edt.columns]
+    df_edt["Enseignants"] = df_edt["Enseignants"].fillna("").astype(str)
     df_edt["ENSEIGNANT_NORM"] = df_edt["Enseignants"].apply(normaliser_nom)
 
     # 3. Coordonnées en arabe
@@ -72,14 +79,18 @@ def charger_donnees():
     for _, vac_row in df_vac.iterrows():
         nom_v = vac_row["NOM"]
         nom_n = vac_row["NOM_NORM"]
+        if not nom_v or not nom_n:
+            continue
         seances = df_edt[df_edt["ENSEIGNANT_NORM"] == nom_n]
         if seances.empty:
             seances = df_edt[df_edt["ENSEIGNANT_NORM"].apply(lambda x: nom_n in x if x else False)]
         
         if not seances.empty:
-            vacataires_avec_charge.append(nom_v)
+            vacataires_avec_charge.append(str(nom_v))
 
-    return df_vac, df_edt, dict_arabe, sorted(list(set(vacataires_avec_charge)))
+    # Tri sécurisé en convertissant explicitement en chaînes de caractères (str)
+    liste_triee = sorted(list(set([str(x) for x in vacataires_avec_charge if pd.notna(x) and str(x).strip()])))
+    return df_vac, df_edt, dict_arabe, liste_triee
 
 try:
     df_vacataires, df_edt, dict_noms_arabe, liste_vacataires_actifs = charger_donnees()
@@ -131,7 +142,7 @@ try:
         wb = openpyxl.load_workbook(FICHIER_TEMPLATE)
         ws = wb.active
 
-        # Inscription séparée du Nom et Prénom en Arabe selon le modèle requis
+        # Inscription séparée du Prénom et Nom en Arabe selon le modèle requis
         ws['A7'] = f"الاسم : {prenom_ar}"
         ws['C7'] = f"اللقب : {nom_ar}"
         ws['A8'] = f"الرتبة : أستاذ مؤقت"

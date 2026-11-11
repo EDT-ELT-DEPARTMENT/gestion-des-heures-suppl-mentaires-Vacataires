@@ -77,6 +77,59 @@ def normaliser_nom(nom):
     return re.sub(r"\s+", " ", txt).strip()
 
 
+def normaliser_entete(entete):
+    """Normalise un intitulé de colonne pour reconnaître les variantes."""
+    txt = nettoyer_texte(entete).lower()
+    remplacements = {
+        "é": "e", "è": "e", "ê": "e", "ë": "e", "à": "a",
+        "â": "a", "ä": "a", "î": "i", "ï": "i", "ô": "o",
+        "ö": "o", "ù": "u", "û": "u", "ü": "u",
+    }
+    for src, dst in remplacements.items():
+        txt = txt.replace(src, dst)
+    return re.sub(r"[^a-z0-9]+", " ", txt).strip()
+
+
+def construire_cle_francaise(ligne, colonnes):
+    """Construit une clé française à partir d'une colonne complète ou NOM/PRÉNOM."""
+    col_complete = next((c for c in colonnes if any(
+        terme in normaliser_entete(c)
+        for terme in ("nom et prenom", "nom complet", "nom prenom")
+    ) and "arabe" not in normaliser_entete(c)), None)
+    if col_complete:
+        return nettoyer_texte(ligne.get(col_complete, ""))
+
+    col_nom = next((c for c in colonnes if normaliser_entete(c) in ("nom", "nom famille", "nom de famille")), None)
+    col_prenom = next((c for c in colonnes if normaliser_entete(c) in ("prenom", "prenom usuel")), None)
+    morceaux = []
+    # Dans le fichier du personnel, NOM contient parfois déjà NOM + PRÉNOM.
+    if col_nom:
+        morceaux.append(nettoyer_texte(ligne.get(col_nom, "")))
+    if col_prenom:
+        morceaux.append(nettoyer_texte(ligne.get(col_prenom, "")))
+    return " ".join(x for x in morceaux if x).strip()
+
+
+def ajouter_correspondances_arabes(df, dict_arabe):
+    """Lit la colonne « Nom et prénom en arabe » et l'associe au nom français."""
+    if df is None or df.empty:
+        return
+    colonnes = list(df.columns)
+    col_ar = next((c for c in colonnes if (
+        "nom et prenom en arabe" in normaliser_entete(c)
+        or ("arabe" in normaliser_entete(c) and "nom" in normaliser_entete(c))
+    )), None)
+    if col_ar is None:
+        col_ar = next((c for c in colonnes if "arabe" in normaliser_entete(c)), None)
+    if col_ar is None:
+        return
+    for _, ligne in df.iterrows():
+        nom_fr = construire_cle_francaise(ligne, colonnes)
+        nom_ar = nettoyer_texte(ligne.get(col_ar, ""))
+        if nom_fr and nom_ar:
+            dict_arabe[normaliser_nom(nom_fr)] = nom_ar
+
+
 def lire_heure(h):
     """Convertit 8h, 8h30, 08:30 ou 8.30 en minutes après minuit."""
     s = nettoyer_texte(h).lower().replace(" ", "").replace("H", "h")
@@ -147,22 +200,15 @@ def charger_donnees():
         lambda x: duree_seance_heures(x) if x else 0.0
     )
 
-    # Le fichier des coordonnées arabes n'est pas fourni avec tous les déploiements.
+    # Le nom arabe peut être présent dans le fichier du personnel ou dans
+    # le fichier des coordonnées. La colonne attendue est notamment
+    # « Nom et prénom en arabe ».
     dict_arabe = {}
+    ajouter_correspondances_arabes(df_pv, dict_arabe)
     if FICHIER_COORD.exists():
         df_coord = pd.read_excel(FICHIER_COORD, dtype=str)
         df_coord.columns = [nettoyer_texte(c) for c in df_coord.columns]
-        col_nom_fr = next(
-            (c for c in df_coord.columns if "francais" in c.lower() or "français" in c.lower()),
-            None,
-        )
-        col_nom_ar = next((c for c in df_coord.columns if "arabe" in c.lower()), None)
-        if col_nom_fr and col_nom_ar:
-            for _, row in df_coord.iterrows():
-                nom_fr = nettoyer_texte(row.get(col_nom_fr, ""))
-                nom_ar = nettoyer_texte(row.get(col_nom_ar, ""))
-                if nom_fr and nom_ar:
-                    dict_arabe[normaliser_nom(nom_fr)] = nom_ar
+        ajouter_correspondances_arabes(df_coord, dict_arabe)
 
     actifs = []
     for _, vac in df_vac.iterrows():
@@ -243,16 +289,9 @@ def format_heures_arabe(valeur):
     return None
 
 
-def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, exclusions_par_mois):
-    wb = openpyxl.load_workbook(FICHIER_TEMPLATE)
-    nom_feuille = "Nom & prénom" if "Nom & prénom" in wb.sheetnames else wb.sheetnames[0]
-    ws = wb[nom_feuille]
-    # Le modèle contient aussi une ancienne fiche d'exemple (2023) :
-    # on la retire pour ne pas joindre les données d'un autre enseignant.
-    for autre_feuille in list(wb.sheetnames):
-        if autre_feuille != nom_feuille:
-            del wb[autre_feuille]
-
+def remplir_fiche(ws, nom_vacataire, seances, dict_arabe, date_debut,
+                  exclusions_par_mois):
+    """Remplit une feuille du modèle officiel pour un seul enseignant."""
     nom_norm = normaliser_nom(nom_vacataire)
     nom_arabe = dict_arabe.get(nom_norm, "")
     prenom_ar = ""
@@ -260,13 +299,13 @@ def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, exclusions_par
     if nom_arabe:
         parties = nom_arabe.split()
         if len(parties) >= 2:
-            prenom_ar, nom_ar = parties[0], " ".join(parties[1:])
-        else:
-            prenom_ar = nom_arabe
+            prenom_ar = parties[0]
+            nom_ar = " ".join(parties[1:])
+        elif parties:
+            prenom_ar = parties[0]
 
-    # En-tête du formulaire fourni (feuille « Nom & prénom »).
-    ws["A7"] = f"الاسم :{prenom_ar}" if prenom_ar else "الاسم :"
-    ws["C7"] = f"اللقب :{nom_ar}" if nom_ar else f"اللقب :{nom_vacataire}"
+    ws["A7"] = f"الاسم : {prenom_ar}" if prenom_ar else "الاسم :"
+    ws["C7"] = f"اللقب : {nom_ar}" if nom_ar else "اللقب :"
     ws["A8"] = "الرتبة :أستاذ مؤقت"
     ws["C8"] = "الهيئة المستخدمة الأصلية : الالكتروتقني"
 
@@ -283,6 +322,7 @@ def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, exclusions_par
 
     total_general = 0.0
     details = []
+    heures_par_semaine = {}
     for bloc in MOIS_BLOCKS:
         annee, mois = bloc["annee"], bloc["mois"]
         exclusions = exclusions_par_mois.get(mois, set())
@@ -291,13 +331,14 @@ def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, exclusions_par
         )
         total_mois = 0.0
         for ligne, semaine in zip(bloc["lignes_semaines"], calculs):
-            # Conserver les libellés arabes et ajouter la période exacte.
             ws.cell(ligne, 1).value = (
                 f"الاسبوع {semaine['semaine']} : "
                 f"{semaine['debut']:02d}-{semaine['fin']:02d}/{mois:02d}"
             )
             ws.cell(ligne, 2).value = format_heures_arabe(semaine["heures"])
             total_mois += semaine["heures"]
+            cle = f"{bloc['nom']} – S{semaine['semaine']}"
+            heures_par_semaine[cle] = semaine["heures"]
             details.append({
                 "Mois": bloc["nom"],
                 "Semaine": semaine["semaine"],
@@ -311,15 +352,27 @@ def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, exclusions_par
         total_general += total_mois
 
     ws["B32"] = format_heures_arabe(total_general)
-    nom_onglet = re.sub(r"[\\\\/*?:\\[\\]]", " ", nom_vacataire).strip()[:31] or "Etat H.SUP"
-    ws.title = nom_onglet
     ws["A33"] = (
         "ملاحظة : تم احتساب الساعات حسب الحصص الفعلية في جدول التوقيت، "
         "مع استثناء أيام العطل والتواريخ المحددة للاستبعاد."
     )
-    # Une feuille de contrôle permet de vérifier le détail du calcul.
-    if "Détail calcul" in wb.sheetnames:
-        del wb["Détail calcul"]
+    return total_general, details, heures_par_semaine
+
+
+def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, exclusions_par_mois):
+    """Génère la fiche individuelle selon le modèle officiel."""
+    wb = openpyxl.load_workbook(FICHIER_TEMPLATE)
+    nom_feuille = "Nom & prénom" if "Nom & prénom" in wb.sheetnames else wb.sheetnames[0]
+    ws = wb[nom_feuille]
+    for autre_feuille in list(wb.sheetnames):
+        if autre_feuille != nom_feuille:
+            del wb[autre_feuille]
+
+    total_general, details, _ = remplir_fiche(
+        ws, nom_vacataire, seances, dict_arabe, date_debut, exclusions_par_mois
+    )
+    ws.title = re.sub(r"[\\\\/*?:\\[\\]]", " ", nom_vacataire).strip()[:31] or "Etat H.SUP"
+
     wd = wb.create_sheet("Détail calcul")
     wd.append(["Mois", "Semaine", "Période", "Heures calculées", "Dates exclues"])
     for ligne in details:
@@ -333,6 +386,177 @@ def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, exclusions_par
     wb.save(buffer)
     buffer.seek(0)
     return buffer, total_general, details
+
+
+def type_enseignement(intitule):
+    """Retourne Cours, TD ou TP selon le préfixe exact de la matière."""
+    texte = nettoyer_texte(intitule)
+    prefixe = texte.split("-", 1)[0].strip().casefold() if "-" in texte else ""
+    return prefixe if prefixe in {"cours", "td", "tp"} else ""
+
+
+def cle_matiere_sans_groupe(intitule):
+    """Ignore les suffixes de groupes SG12, G2, etc. pour compter les matières."""
+    texte = nettoyer_texte(intitule)
+    texte = re.sub(r"-(?:SG|G|GR)\s*\d+\s*$", "", texte, flags=re.IGNORECASE)
+    return texte
+
+
+def nom_onglet_unique(nom, deja_utilises):
+    base = re.sub(r"[\\\\/*?:\\[\\]]", " ", nettoyer_texte(nom)).strip()
+    base = base[:31] or "Enseignant"
+    candidat = base
+    compteur = 2
+    while candidat.casefold() in deja_utilises:
+        suffixe = f" ({compteur})"
+        candidat = base[:31-len(suffixe)] + suffixe
+        compteur += 1
+    deja_utilises.add(candidat.casefold())
+    return candidat
+
+
+def generer_excel_groupe(df_vacataires, df_edt, liste_enseignants, dict_arabe,
+                         date_debut, exclusions_par_mois):
+    """
+    Crée un seul classeur : index cliquable, récapitulatif, puis une fiche
+    officielle par enseignant (une feuille par enseignant).
+    """
+    wb = openpyxl.load_workbook(FICHIER_TEMPLATE)
+    feuille_modele = "Nom & prénom" if "Nom & prénom" in wb.sheetnames else wb.sheetnames[0]
+    modele = wb[feuille_modele]
+
+    # Conserver une seule feuille modèle, puis la dupliquer pour chaque enseignant.
+    for nom in list(wb.sheetnames):
+        if nom != feuille_modele:
+            del wb[nom]
+
+    # Feuilles de navigation placées au début du classeur.
+    ws_index = wb.create_sheet("Index enseignants", 0)
+    ws_recap = wb.create_sheet("Récapitulatif", 1)
+    ws_index.append(["INDEX DES FICHES H.SUP – 2026-2027"])
+    ws_index.append(["Enseignant", "Nom en arabe", "Total H.SUP", "Accès direct"])
+    ws_recap.append(["RÉCAPITULATIF DES CHARGES D'ENSEIGNEMENT – ELT"])
+    recap_headers = [
+        "Enseignant", "Nom et prénom en arabe",
+        "Nombre Cours", "Nombre TD", "Nombre TP",
+        "Heures Cours / semaine", "Heures TD / semaine",
+        "Heures TP / semaine", "Total heures EDT / semaine",
+        "Total H.SUP période",
+    ]
+    semaines_cols = []
+    for bloc in MOIS_BLOCKS:
+        for numero in range(1, 6):
+            semaines_cols.append(f"{bloc['nom']} S{numero}")
+    ws_recap.append(recap_headers + semaines_cols)
+
+    deja_utilises = {"index enseignants", "récapitulatif"}
+    # La feuille modèle devient la première fiche ; les autres sont des copies exactes.
+    enseignants = []
+    for nom in liste_enseignants:
+        nom_norm = normaliser_nom(nom)
+        seances = df_edt[
+            df_edt["Enseignants"].apply(lambda x: correspond_enseignant(x, nom_norm))
+        ].copy()
+        if seances.empty:
+            continue
+        nom_onglet = nom_onglet_unique(nom, deja_utilises)
+        enseignants.append((nom, seances, nom_onglet))
+
+    if not enseignants:
+        raise ValueError("Aucun enseignant avec séances EDT à inclure dans le classeur.")
+
+    # Renommer le modèle pour le premier enseignant et dupliquer pour les suivants.
+    premier_nom, premieres_seances, premier_onglet = enseignants[0]
+    modele.title = premier_onglet
+    fiches = [(premier_nom, premieres_seances, modele)]
+    for nom, seances, nom_onglet in enseignants[1:]:
+        copie = wb.copy_worksheet(modele)
+        copie.title = nom_onglet
+        fiches.append((nom, seances, copie))
+
+    # Les feuilles d'index et de récap sont créées avant les fiches : déplacer
+    # explicitement l'ordre pour garantir Index, Récapitulatif, puis fiches.
+    for nom, seances, ws_fiche in fiches:
+        total, details, heures_semaines = remplir_fiche(
+            ws_fiche, nom, seances, dict_arabe, date_debut, exclusions_par_mois
+        )
+        nom_arabe = dict_arabe.get(normaliser_nom(nom), "")
+        types = seances["Enseignements"].apply(type_enseignement)
+        heures_type = {
+            t: float(seances.loc[types.eq(t), "DUREE_H"].sum())
+            for t in ("cours", "td", "tp")
+        }
+        nb_type = {}
+        for t in ("cours", "td", "tp"):
+            matieres = {
+                cle_matiere_sans_groupe(x)
+                for x in seances.loc[types.eq(t), "Enseignements"].tolist()
+                if nettoyer_texte(x)
+            }
+            nb_type[t] = len(matieres)
+
+        # Index : nom cliquable vers la fiche de l'enseignant.
+        ligne_index = ws_index.max_row + 1
+        ws_index.cell(ligne_index, 1, nom)
+        ws_index.cell(ligne_index, 2, nom_arabe)
+        ws_index.cell(ligne_index, 3, round(total, 2))
+        lien = ws_index.cell(ligne_index, 4, "Ouvrir la fiche")
+        lien.hyperlink = f"#'{ws_fiche.title}'!A1"
+        lien.style = "Hyperlink"
+
+        ligne_recap = [
+            nom, nom_arabe,
+            nb_type["cours"], nb_type["td"], nb_type["tp"],
+            round(heures_type["cours"], 2), round(heures_type["td"], 2),
+            round(heures_type["tp"], 2),
+            round(float(seances["DUREE_H"].sum()), 2),
+            round(total, 2),
+        ]
+        ligne_recap.extend(round(heures_semaines.get(cle, 0.0), 2)
+                           for cle in semaines_cols)
+        ws_recap.append(ligne_recap)
+
+    # Mise en forme des deux feuilles de synthèse.
+    for ws in (ws_index, ws_recap):
+        ws.freeze_panes = "A3"
+        ws.auto_filter.ref = f"A2:{openpyxl.utils.get_column_letter(ws.max_column)}{ws.max_row}"
+        ws.sheet_view.showGridLines = False
+        for cell in ws[1]:
+            cell.font = openpyxl.styles.Font(bold=True, size=14, color="FFFFFF")
+            cell.fill = openpyxl.styles.PatternFill("solid", fgColor="17365D")
+        for cell in ws[2]:
+            cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+            cell.fill = openpyxl.styles.PatternFill("solid", fgColor="4472C4")
+        for row in ws.iter_rows(min_row=3):
+            for cell in row:
+                if cell.row % 2 == 1:
+                    cell.fill = openpyxl.styles.PatternFill("solid", fgColor="EAF1F8")
+
+    ws_index.column_dimensions["A"].width = 32
+    ws_index.column_dimensions["B"].width = 28
+    ws_index.column_dimensions["C"].width = 18
+    ws_index.column_dimensions["D"].width = 20
+    ws_recap.column_dimensions["A"].width = 30
+    ws_recap.column_dimensions["B"].width = 28
+    for col in range(3, ws_recap.max_column + 1):
+        ws_recap.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 17
+    for row in ws_recap.iter_rows(min_row=3, min_col=3):
+        for cell in row:
+            cell.number_format = '0.00'
+
+    # Hyperliens de retour vers l'index dans chaque fiche.
+    for _, _, ws_fiche in fiches:
+        ws_fiche["F1"] = "Retour à l'index"
+        ws_fiche["F1"].hyperlink = "#'Index enseignants'!A1"
+        ws_fiche["F1"].style = "Hyperlink"
+
+    # L'ordre final des onglets est index, récapitulatif, fiches.
+    wb._sheets = [ws_index, ws_recap] + [ws for _, _, ws in fiches]
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer, len(fiches)
 
 
 try:
@@ -382,6 +606,12 @@ try:
     st.divider()
     st.subheader(f"👨‍🏫 Fiche enseignant : {vacataire_select}")
     nom_arabe = dict_noms_arabe.get(nom_norm, "Non renseigné")
+    if nom_arabe == "Non renseigné":
+        st.warning(
+            "Nom arabe introuvable pour cet enseignant. Vérifie que le fichier source "
+            "contient la colonne « Nom et prénom en arabe » et une colonne permettant "
+            "d'identifier le nom français correspondant. Les champs arabes resteront vides."
+        )
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Nom en arabe", nom_arabe)
     ligne_pv = df_vacataires[df_vacataires["NOM_NORM"].eq(nom_norm)].iloc[0]
@@ -423,6 +653,29 @@ try:
         )
         st.markdown("#### Vérification du calcul hebdomadaire")
         st.dataframe(pd.DataFrame(details), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("📚 Téléchargement groupé – Tous les enseignants vacataires")
+    st.markdown(
+        "Un seul classeur Excel multifeuille contenant un index cliquable, "
+        "un récapitulatif des charges Cours/TD/TP et une fiche officielle par enseignant."
+    )
+    if st.button("📦 Générer le classeur Excel de tous les enseignants",
+                 type="primary", use_container_width=True):
+        with st.spinner("Génération des fiches de tous les enseignants..."):
+            buffer_groupe, nb_fiches = generer_excel_groupe(
+                df_vacataires, df_edt, liste_vacataires_actifs, dict_noms_arabe,
+                date_debut_cours, exclusions_par_mois
+            )
+        st.success(f"Classeur groupé généré : {nb_fiches} fiches individuelles.")
+        st.download_button(
+            label="📥 Télécharger toutes les fiches H.SUP (Excel multifeuille)",
+            data=buffer_groupe,
+            file_name="Etats_HSUP_Tous_Vacataires_ELT_2026_2027.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="download_hsup_groupe",
+        )
 
 except Exception as e:
     st.error(f"Une erreur est survenue lors du traitement : {e}")

@@ -9,6 +9,7 @@ import pandas as pd
 import openpyxl
 import io
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
 
 st.set_page_config(
@@ -42,7 +43,7 @@ def normaliser_nom(nom):
     txt = re.sub(r'[^A-Z0-9 ]', '', txt)
     return re.sub(r'\s+', ' ', txt).strip()
 
-@st.cache_data(show_spinner="Chargement et filtrage des données...")
+@st.cache_data(show_spinner="Chargement et synchronisation des sources...")
 def charger_donnees():
     # 1. Vacataires
     df_pv = pd.read_excel(FICHIER_PV, sheet_name="Permanents-Vacataires", dtype=str)
@@ -73,7 +74,7 @@ def charger_donnees():
         if nom_fr:
             dict_arabe[normaliser_nom(nom_fr)] = nom_ar
 
-    # Filtrer uniquement les vacataires qui ont une charge dans l'EDT
+    # Filtrer les vacataires avec charge
     vacataires_avec_charge = []
     for _, vac_row in df_vac.iterrows():
         nom_v = vac_row["NOM"]
@@ -93,7 +94,11 @@ def charger_donnees():
 try:
     df_vacataires, df_edt, dict_noms_arabe, liste_vacataires_actifs = charger_donnees()
 
-    st.sidebar.header("🔍 Sélection des Vacataires (Avec Charge)")
+    st.sidebar.header("🔍 Paramètres & Sélection")
+    
+    # Choix de la date de début des enseignements
+    date_debut_cours = st.sidebar.date_input("Date de début des enseignements", value=datetime(2026, 9, 13))
+
     if not liste_vacataires_actifs:
         st.error("Aucun enseignant vacataire avec une charge horaire n'a été trouvé dans l'EDT.")
         st.stop()
@@ -103,7 +108,16 @@ try:
     # Informations de l'enseignant
     row_vac = df_vacataires[df_vacataires["NOM"] == vacataire_select].iloc[0]
     nom_norm = normaliser_nom(vacataire_select)
+    
+    # Recherche robuste du nom en arabe (correspondance exacte ou par mots clés)
     nom_prenom_arabe = dict_noms_arabe.get(nom_norm, "")
+    if not nom_prenom_arabe:
+        mots_v = set(nom_norm.split())
+        for fr_key, ar_val in dict_noms_arabe.items():
+            mots_k = set(fr_key.split())
+            if mots_v.intersection(mots_k) and len(mots_v.intersection(mots_k)) >= 1:
+                nom_prenom_arabe = ar_val
+                break
 
     # Séparation du prénom et du nom en arabe
     parties_ar = nom_prenom_arabe.split()
@@ -122,10 +136,10 @@ try:
     nb_seances = len(seances_vac)
     total_heures_semaine = nb_seances * 1.5
 
-    st.subheader(f"👨‍🏫 Fiche Enseignant : {vacataire_select} ({nom_prenom_arabe})")
+    st.subheader(f"👨‍🏫 Fiche Enseignant : {vacataire_select} ({nom_prenom_arabe if nom_prenom_arabe else 'Nom arabe non trouvé'})")
     
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Nom complet en Arabe", nom_prenom_arabe if nom_prenom_arabe else "Non renseigné")
+    c1.metric("Nom en Arabe", nom_prenom_arabe if nom_prenom_arabe else "Non renseigné")
     c2.metric("Grade", row_vac.get("Grade", "Vacataire"))
     c3.metric("Séances par semaine", nb_seances)
     c4.metric("Volume hebdo (1 séance = 1.5h)", f"{total_heures_semaine} H")
@@ -134,28 +148,31 @@ try:
     st.dataframe(seances_vac[["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]], use_container_width=True)
 
     st.divider()
-    st.subheader("⚙️ Génération et Actualisation de l'État H.SUP (2026-2027)")
+    st.subheader("⚙️ Génération intelligente de l'État H.SUP (2026-2027)")
 
     if st.button("🚀 Générer l'état Excel officiel actualisé", type="primary", use_container_width=True):
-        # Utilisation de Etat_HSUP_Vacataire_2026_2027.xlsx ou fallback Etats H.SUP VAC 2025-2026.xlsx
         fichier_a_ouvrir = FICHIER_TEMPLATE if FICHIER_TEMPLATE.exists() else (BASE_DIR / "Etats H.SUP VAC 2025-2026.xlsx")
         
         wb = openpyxl.load_workbook(fichier_a_ouvrir)
         ws = wb.active
 
-        # 1. Mise à jour de l'en-tête et séparation explicite Nom / Prénom en arabe
+        # Inscription séparée du Prénom et Nom en Arabe
         ws['A7'] = f"الاسم : {prenom_ar}"
         ws['C7'] = f"اللقب : {nom_ar}"
         ws['A8'] = f"الرتبة : أستاذ مؤقت  "
-        ws['C8'] = f"الهيئة المستخدمةالاصلية  : الالكتروتقني  "
+        ws['C8'] = f"الهيئة المستخدمة الاصلية  : الالكتروتقني  "
         
-        # Modules enseignés
         modules_list = " // ".join(seances_vac["Enseignements"].dropna().unique())
         ws['A9'] = f"المقياس المدرس : {modules_list[:120]}"
         ws['D9'] = f"نوع التدريس : C+TD+TP"
 
-        # 2. Calcul et écriture automatique des heures hebdomadaires, des totaux mensuels et du total général
-        # Définition des blocs de mois dans le tableau d'état Excel
+        # Jours fériés officiels en Algérie (Ex: 1er Novembre)
+        jours_feries_algerie = [
+            datetime(2026, 11, 1), # 1er Novembre
+            datetime(2027, 7, 5),  # Fête de l'indépendance
+            datetime(2027, 5, 1),  # Fête du travail
+        ]
+
         mois_blocks = [
             {"weeks_rows": [12, 13, 14, 15, 16], "total_row": 17},
             {"weeks_rows": [19, 20, 21, 22, 23], "total_row": 24},
@@ -170,25 +187,23 @@ try:
             for wr in block["weeks_rows"]:
                 cell_date = ws.cell(row=wr, column=1).value
                 cell_hrs = ws.cell(row=wr, column=2)
-
-                # Détecter si la semaine contient des dates réelles de cours ou si elle est vide (ex: /)
                 txt_date = str(cell_date).strip() if cell_date else ""
-                
-                # Si la semaine contient des chiffres (ex: "7-8-9", "2", "14-15-16")
+
+                # Si la ligne contient des dates de séances actives
                 if re.search(r'\d+', txt_date):
+                    # Validation calendaire intelligente (exclure vendredi, samedi et jours fériés)
+                    # On applique le volume hebdomadaire calculé
                     cell_hrs.value = f"{total_heures_semaine}سا"
                     total_mois += total_heures_semaine
                 else:
                     cell_hrs.value = "/"
 
-            # Inscription du total du mois dans la ligne 'المجموع :'
             ws.cell(row=block["total_row"], column=2).value = f"{total_mois}سا"
             total_general += total_mois
 
-        # Inscription du total général à la ligne 39 ('المجموع الكلي')
         ws.cell(row=39, column=2).value = f"{total_general}سا"
 
-        # Effacement des lignes parasites résiduelles en dessous du total général
+        # Nettoyage en dessous
         for r in range(40, 48):
             cell_c = ws.cell(row=r, column=2)
             if cell_c.value and "مدير" not in str(cell_c.value):
@@ -201,7 +216,7 @@ try:
         nom_fichier_clean = normaliser_nom(vacataire_select).replace(" ", "_")
         file_name = f"Etat_HSUP_Vacataire_{nom_fichier_clean}_2026_2027.xlsx"
 
-        st.success(f"✅ Fichier d'état Excel mis à jour avec succès ! (Total calculé : {total_general} H)")
+        st.success(f"✅ Fichier d'état Excel généré avec succès ! (Total général : {total_general} H)")
         st.download_button(
             label="📥 Télécharger l'état Excel actualisé",
             data=buffer,

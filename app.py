@@ -131,8 +131,8 @@ try:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Nom en Arabe", nom_prenom_arabe if nom_prenom_arabe else "Non renseigné")
     c2.metric("Grade", row_vac.get("Grade", "Vacataire"))
-    c3.metric("Séances par semaine", nb_seances)
-    c4.metric("Volume hebdo ref", f"{total_heures_semaine_ref} H")
+    c3.metric("Séances par semaine (EDT)", nb_seances)
+    c4.metric("Volume hebdo (1.5h/séance)", f"{total_heures_semaine_ref} H")
 
     st.markdown("### 📅 Séances hebdomadaires de l'Emploi du Temps (S1)")
     st.dataframe(seances_vac[["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]], use_container_width=True)
@@ -155,13 +155,7 @@ try:
         ws['A9'] = f"المقياس المدرس : {modules_list[:120]}"
         ws['D9'] = f"نوع التدريس : C+TD+TP"
 
-        # Jours fériés officiels en Algérie
-        jours_feries = [
-            date(2026, 11, 1), # 1er Novembre
-            date(2027, 5, 1),  # 1er Mai
-            date(2027, 7, 5),  # Fête de l'Indépendance
-        ]
-
+        # Blocs de mois avec leur date de début approximative pour comparaison avec date_debut_cours
         mois_blocks = [
             {"weeks_rows": [12, 13, 14, 15, 16], "total_row": 17, "annee": 2026, "mois_num": 9},   # Septembre
             {"weeks_rows": [19, 20, 21, 22, 23], "total_row": 24, "annee": 2026, "mois_num": 10},  # Octobre
@@ -181,37 +175,29 @@ try:
                 cell_hrs = ws.cell(row=wr, column=2)
                 txt_date = str(cell_date).strip() if cell_date else ""
 
-                # Extraction stricte de la partie APRÈS les deux-points ':' (ex: "الاسبوع 2 :7-8-9" -> "7-8-9")
-                if ":" in txt_date:
-                    partie_jours = txt_date.split(":")[-1].strip()
+                # On extrait le premier jour de la semaine indiqué ou on estime le mois
+                jours_str = re.findall(r'\d+', txt_date.split(":")[-1] if ":" in txt_date else txt_date)
+                
+                # Déterminer si cette ligne de semaine est >= date_debut_cours
+                semaine_active = False
+                if jours_str:
+                    try:
+                        premier_j = int(jours_str[0])
+                        d_semaine = date(annee_m, mois_m, premier_j)
+                        if d_semaine >= date_debut_cours:
+                            semaine_active = True
+                    except ValueError:
+                        pass
                 else:
-                    partie_jours = txt_date
+                    # Si aucune date précise n'est écrite dans le template pour cette semaine, 
+                    # on se base sur le mois global par rapport à la date de début
+                    dernier_jour_mois = date(annee_m + (1 if mois_m == 12 else 0), 1 if mois_m == 12 else mois_m + 1, 1)
+                    if dernier_jour_mois > date_debut_cours:
+                        semaine_active = True
 
-                # Récupération uniquement des chiffres de jours dans cette partie
-                jours_str = re.findall(r'\d+', partie_jours)
-
-                if jours_str and "/" not in partie_jours:
-                    jours_total_semaine = len(jours_str)
-                    jours_travailles_valides = 0
-
-                    for j_str in jours_str:
-                        j = int(j_str)
-                        try:
-                            d_courante = date(annee_m, mois_m, j)
-                            # Vérification rigoureuse : >= date début, pas vendredi (4) ou samedi (5), pas jour férié
-                            if d_courante >= date_debut_cours:
-                                if d_courante.weekday() not in [4, 5] and d_courante not in jours_feries:
-                                    jours_travailles_valides += 1
-                        except ValueError:
-                            continue
-
-                    # Calcul proportionnel basé strictement sur les jours réels travaillés
-                    if jours_travailles_valides > 0 and jours_total_semaine > 0:
-                        heures_semaine = total_heures_semaine_ref * (jours_travailles_valides / jours_total_semaine)
-                        cell_hrs.value = f"{round(heures_semaine, 1)}سا"
-                        total_mois += heures_semaine
-                    else:
-                        cell_hrs.value = None
+                if semaine_active:
+                    cell_hrs.value = f"{round(total_heures_semaine_ref, 1)}سا"
+                    total_mois += total_heures_semaine_ref
                 else:
                     cell_hrs.value = None
 

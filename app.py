@@ -59,6 +59,8 @@ MOIS_BLOCKS = [
      "lignes_semaines": [19, 20, 21, 22, 23], "ligne_total": 24, "ligne_entete": 18},
     {"nom": "Novembre 2026", "annee": 2026, "mois": 11,
      "lignes_semaines": [26, 27, 28, 29, 30], "ligne_total": 31, "ligne_entete": 25},
+    {"nom": "Décembre 2026", "annee": 2026, "mois": 12,
+     "lignes_semaines": [33, 34, 35, 36, 37], "ligne_total": 38, "ligne_entete": 32},
 ]
 
 # Jours fériés fixes applicables à la période couverte par le modèle.
@@ -325,24 +327,29 @@ def etiquettes_dates(annee, mois):
     return labels
 
 
-def calculer_heures_par_semaine(seances, annee, mois, date_debut, exclusions):
+def calculer_heures_par_semaine(seances, annee, mois, date_debut, date_fin, exclusions):
     """
     Le modèle fourni réserve cinq lignes par mois : les semaines sont donc
     les tranches 1–7, 8–14, 15–21, 22–28 et 29–fin du mois.
     Pour chaque date admissible, on additionne les séances EDT de son jour.
-    Vendredi/samedi, jours fériés, dates antérieures au début et exclusions
-    manuelles sont retirés.
+    Vendredi/samedi, jours fériés, dates hors période (avant le début ou
+    après la fin) et exclusions manuelles sont retirés.
     """
     resultats = []
     jours_invalides = {4, 5}  # vendredi et samedi en Algérie
     for numero in range(5):
         debut_jour = numero * 7 + 1
         fin_jour = min(debut_jour + 6, calendar.monthrange(annee, mois)[1])
+        debut_semaine = date(annee, mois, debut_jour)
+        fin_semaine = date(annee, mois, fin_jour)
+        debut_affiche = max(debut_semaine, date_debut)
+        fin_affiche = min(fin_semaine, date_fin)
+        semaine_dans_periode = debut_affiche <= fin_affiche
         total = 0.0
         dates_comptees = []
         for jour_mois in range(debut_jour, fin_jour + 1):
             d = date(annee, mois, jour_mois)
-            if d < date_debut or d.weekday() in jours_invalides:
+            if d < date_debut or d > date_fin or d.weekday() in jours_invalides:
                 continue
             if d in JOURS_FERIES or d in exclusions:
                 continue
@@ -359,8 +366,8 @@ def calculer_heures_par_semaine(seances, annee, mois, date_debut, exclusions):
                 dates_comptees.append(d)
         resultats.append({
             "semaine": numero + 1,
-            "debut": debut_jour,
-            "fin": fin_jour,
+            "debut": debut_affiche.day if semaine_dans_periode else None,
+            "fin": fin_affiche.day if semaine_dans_periode else None,
             "heures": round(total, 2),
             "dates": dates_comptees,
         })
@@ -381,7 +388,7 @@ def format_heures_arabe(valeur):
 
 
 def remplir_fiche(ws, nom_vacataire, seances, dict_arabe, date_debut,
-                  exclusions_par_mois):
+                  date_fin, exclusions_par_mois):
     """Remplit une feuille du modèle officiel pour un seul enseignant."""
     nom_norm = normaliser_nom(nom_vacataire)
     identite_arabe = dict_arabe.get(nom_norm, {})
@@ -418,29 +425,54 @@ def remplir_fiche(ws, nom_vacataire, seances, dict_arabe, date_debut,
     ]
     ws["D9"] = "نوع التدريس : " + "+".join(types_ordre)
 
+    # Réserver dans le modèle les lignes 32 à 39 au mois de décembre
+    # et au nouveau total général. On reprend les styles de novembre pour
+    # conserver exactement la présentation du tableau officiel.
+    for ligne_source, ligne_cible in zip(range(25, 33), range(32, 40)):
+        for colonne in range(1, 6):
+            ws.cell(ligne_cible, colonne)._style = copy.copy(
+                ws.cell(ligne_source, colonne)._style
+            )
+        hauteur = ws.row_dimensions[ligne_source].height
+        if hauteur is not None:
+            ws.row_dimensions[ligne_cible].height = hauteur
+
     total_general = 0.0
     details = []
     heures_par_semaine = {}
+    mois_arabe = {
+        9: "سبتمبر", 10: "أكتوبر", 11: "نوفمبر", 12: "ديسمبر"
+    }
     for bloc in MOIS_BLOCKS:
         annee, mois = bloc["annee"], bloc["mois"]
         exclusions = exclusions_par_mois.get(mois, set())
+        ws.cell(bloc["ligne_entete"], 1).value = (
+            f"شهر:{mois_arabe.get(mois, bloc['nom'])} {annee}"
+        )
         calculs = calculer_heures_par_semaine(
-            seances, annee, mois, date_debut, exclusions
+            seances, annee, mois, date_debut, date_fin, exclusions
         )
         total_mois = 0.0
         for ligne, semaine in zip(bloc["lignes_semaines"], calculs):
-            ws.cell(ligne, 1).value = (
-                f"الاسبوع {semaine['semaine']} : "
-                f"{semaine['debut']:02d}-{semaine['fin']:02d}/{mois:02d}"
-            )
-            ws.cell(ligne, 2).value = format_heures_arabe(semaine["heures"])
+            if semaine["debut"] is None:
+                ws.cell(ligne, 1).value = f"الاسبوع {semaine['semaine']} : /"
+                ws.cell(ligne, 2).value = "/"
+            else:
+                ws.cell(ligne, 1).value = (
+                    f"الاسبوع {semaine['semaine']} : "
+                    f"{semaine['debut']:02d}-{semaine['fin']:02d}/{mois:02d}"
+                )
+                ws.cell(ligne, 2).value = format_heures_arabe(semaine["heures"]) or "/"
             total_mois += semaine["heures"]
             cle = f"{bloc['nom']} – S{semaine['semaine']}"
             heures_par_semaine[cle] = semaine["heures"]
             details.append({
                 "Mois": bloc["nom"],
                 "Semaine": semaine["semaine"],
-                "Période": f"{semaine['debut']:02d}–{semaine['fin']:02d}/{mois:02d}",
+                "Période": (
+                    f"{semaine['debut']:02d}–{semaine['fin']:02d}/{mois:02d}"
+                    if semaine["debut"] is not None else "/"
+                ),
                 "Heures calculées": semaine["heures"],
                 "Dates exclues": ", ".join(
                     d.strftime("%d/%m/%Y") for d in sorted(exclusions)
@@ -449,15 +481,17 @@ def remplir_fiche(ws, nom_vacataire, seances, dict_arabe, date_debut,
         ws.cell(bloc["ligne_total"], 2).value = format_heures_arabe(total_mois)
         total_general += total_mois
 
-    ws["B32"] = format_heures_arabe(total_general)
-    ws["A33"] = (
-        "ملاحظة : تم احتساب الساعات حسب الحصص الفعلية في جدول التوقيت، "
+    # Le total général vient après le bloc Décembre (ligne 39).
+    ws["B39"] = format_heures_arabe(total_general)
+    ws["A41"] = (
+        f"ملاحظة : تم احتساب الساعات من {date_debut.strftime('%d/%m/%Y')} "
+        f"إلى {date_fin.strftime('%d/%m/%Y')} حسب الحصص الفعلية في جدول التوقيت، "
         "مع استثناء أيام العطل والتواريخ المحددة للاستبعاد."
     )
     return total_general, details, heures_par_semaine
 
 
-def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, exclusions_par_mois):
+def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, date_fin, exclusions_par_mois):
     """Génère la fiche individuelle selon le modèle officiel."""
     wb = openpyxl.load_workbook(FICHIER_TEMPLATE)
     nom_feuille = "Nom & prénom" if "Nom & prénom" in wb.sheetnames else wb.sheetnames[0]
@@ -469,7 +503,7 @@ def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, exclusions_par
             del wb[autre_feuille]
 
     total_general, details, _ = remplir_fiche(
-        ws, nom_vacataire, seances, dict_arabe, date_debut, exclusions_par_mois
+        ws, nom_vacataire, seances, dict_arabe, date_debut, date_fin, exclusions_par_mois
     )
     ws.title = re.sub(r"[\\\\/*?:\\[\\]]", " ", nom_vacataire).strip()[:31] or "Etat H.SUP"
 
@@ -516,7 +550,7 @@ def nom_onglet_unique(nom, deja_utilises):
 
 
 def generer_excel_groupe(df_vacataires, df_edt, liste_enseignants, dict_arabe,
-                         date_debut, exclusions_par_mois):
+                         date_debut, date_fin, exclusions_par_mois):
     """
     Crée un seul classeur : index cliquable, récapitulatif, puis une fiche
     officielle par enseignant (une feuille par enseignant).
@@ -534,6 +568,7 @@ def generer_excel_groupe(df_vacataires, df_edt, liste_enseignants, dict_arabe,
     ws_index = wb.create_sheet("Index enseignants", 0)
     ws_recap = wb.create_sheet("Récapitulatif", 1)
     ws_index.append(["INDEX DES FICHES H.SUP – 2026-2027"])
+    ws_index.append(["Période de comptabilisation", f"Du {date_debut.strftime('%d/%m/%Y')} au {date_fin.strftime('%d/%m/%Y')}"])
     ws_index.append(["Enseignant", "Nom en arabe", "Total H.SUP", "Accès direct"])
     ws_recap.append(["RÉCAPITULATIF DES CHARGES D'ENSEIGNEMENT – ELT"])
     recap_headers = [
@@ -599,7 +634,7 @@ def generer_excel_groupe(df_vacataires, df_edt, liste_enseignants, dict_arabe,
     # explicitement l'ordre pour garantir Index, Récapitulatif, puis fiches.
     for nom, seances, ws_fiche in fiches:
         total, details, heures_semaines = remplir_fiche(
-            ws_fiche, nom, seances, dict_arabe, date_debut, exclusions_par_mois
+            ws_fiche, nom, seances, dict_arabe, date_debut, date_fin, exclusions_par_mois
         )
         identite_arabe = dict_arabe.get(normaliser_nom(nom), {})
         nom_arabe = (identite_arabe.get("complet", "")
@@ -640,17 +675,20 @@ def generer_excel_groupe(df_vacataires, df_edt, liste_enseignants, dict_arabe,
         ws_recap.append(ligne_recap)
 
     # Mise en forme des deux feuilles de synthèse.
+    ws_index.freeze_panes = "A4"
+    ws_index.auto_filter.ref = f"A3:{openpyxl.utils.get_column_letter(ws_index.max_column)}{ws_index.max_row}"
+    ws_recap.freeze_panes = "A3"
+    ws_recap.auto_filter.ref = f"A2:{openpyxl.utils.get_column_letter(ws_recap.max_column)}{ws_recap.max_row}"
     for ws in (ws_index, ws_recap):
-        ws.freeze_panes = "A3"
-        ws.auto_filter.ref = f"A2:{openpyxl.utils.get_column_letter(ws.max_column)}{ws.max_row}"
         ws.sheet_view.showGridLines = False
         for cell in ws[1]:
             cell.font = openpyxl.styles.Font(bold=True, size=14, color="FFFFFF")
             cell.fill = openpyxl.styles.PatternFill("solid", fgColor="17365D")
-        for cell in ws[2]:
+        entete_ligne = 3 if ws is ws_index else 2
+        for cell in ws[entete_ligne]:
             cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
             cell.fill = openpyxl.styles.PatternFill("solid", fgColor="4472C4")
-        for row in ws.iter_rows(min_row=3):
+        for row in ws.iter_rows(min_row=entete_ligne + 1):
             for cell in row:
                 if cell.row % 2 == 1:
                     cell.fill = openpyxl.styles.PatternFill("solid", fgColor="EAF1F8")
@@ -687,7 +725,23 @@ try:
 
     st.sidebar.header("🔍 Paramètres & calendrier")
     date_debut_cours = st.sidebar.date_input(
-        "Date de début des enseignements", value=date(2026, 9, 23)
+        "Date de début de comptabilisation des H.SUP",
+        value=date(2026, 9, 23),
+        min_value=date(2026, 1, 1),
+        max_value=date(2026, 12, 31),
+    )
+    date_fin_comptabilisation = st.sidebar.date_input(
+        "Date de fin de comptabilisation des H.SUP",
+        value=date(2026, 12, 17),
+        min_value=date(2026, 1, 1),
+        max_value=date(2026, 12, 31),
+    )
+    if date_debut_cours > date_fin_comptabilisation:
+        st.sidebar.error("La date de début doit être antérieure ou égale à la date de fin.")
+        st.stop()
+    st.sidebar.info(
+        f"Période comptabilisée : du {date_debut_cours.strftime('%d/%m/%Y')} "
+        f"au {date_fin_comptabilisation.strftime('%d/%m/%Y')} inclus."
     )
     vacataire_select = st.sidebar.selectbox(
         "Choisir un enseignant vacataire", liste_vacataires_actifs
@@ -705,8 +759,9 @@ try:
     # Contrôles de calendrier : les jours fériés sont exclus automatiquement.
     st.subheader("📅 Calendrier et jours à exclure")
     st.info(
-        "Les vendredis et samedis sont automatiquement exclus. "
-        "Les jours fériés nationaux fixes connus sont exclus automatiquement. "
+        "Les heures sont comptabilisées uniquement entre les deux dates choisies "
+        "(par défaut du 23 septembre au 17 décembre 2026 inclus). "
+        "Les vendredis, samedis et jours fériés nationaux fixes connus sont exclus. "
         "Sélectionne ci-dessous toute autre date sans enseignement à comptabiliser."
     )
     exclusions_par_mois = {}
@@ -715,9 +770,14 @@ try:
         with col:
             st.markdown(f"**{bloc['nom']}**")
             labels = etiquettes_dates(bloc["annee"], bloc["mois"])
+            dates_dans_periode = [
+                cle for cle in labels
+                if date.fromisoformat(cle) >= date_debut_cours
+                and date.fromisoformat(cle) <= date_fin_comptabilisation
+            ]
             choix = st.multiselect(
                 f"Dates à exclure – {bloc['nom']}",
-                options=list(labels.keys()),
+                options=dates_dans_periode,
                 format_func=lambda x, d=labels: d[x],
                 default=[],
                 key=f"exclusions_{bloc['annee']}_{bloc['mois']}",
@@ -760,7 +820,7 @@ try:
                  use_container_width=True):
         buffer, total_general, details = generer_excel(
             vacataire_select, seances_vac, dict_noms_arabe,
-            date_debut_cours, exclusions_par_mois
+            date_debut_cours, date_fin_comptabilisation, exclusions_par_mois
         )
         nom_fichier_clean = normaliser_nom(vacataire_select).replace(" ", "_")
         file_name = f"Etat_HSUP_Vacataire_{nom_fichier_clean}_2026_2027.xlsx"
@@ -789,7 +849,7 @@ try:
         with st.spinner("Génération des fiches de tous les enseignants..."):
             buffer_groupe, nb_fiches = generer_excel_groupe(
                 df_vacataires, df_edt, liste_vacataires_actifs, dict_noms_arabe,
-                date_debut_cours, exclusions_par_mois
+                date_debut_cours, date_fin_comptabilisation, exclusions_par_mois
             )
         st.success(f"Classeur groupé généré : {nb_fiches} fiches individuelles.")
         st.download_button(

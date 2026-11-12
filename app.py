@@ -30,9 +30,25 @@ st.markdown("**Département d'Électrotechnique - Faculté de génie électrique
 st.divider()
 
 BASE_DIR = Path(__file__).resolve().parent
-FICHIER_PV = BASE_DIR / "Permanents-Vacataires-ELT2-2026-2027.xlsx"
-FICHIER_EDT = BASE_DIR / "dataEDT-ELT-S1-2027.xlsx"
-FICHIER_COORD = BASE_DIR / "Vos coordonnées en Arabe (réponses).xlsx"  # facultatif
+def choisir_fichier(nom_standard, variantes=()):
+    """Retrouve le fichier sous son nom normal ou avec suffixe de téléchargement."""
+    candidats = [BASE_DIR / nom_standard] + [BASE_DIR / nom for nom in variantes]
+    return next((f for f in candidats if f.exists()), candidats[0])
+
+
+FICHIER_PV = choisir_fichier(
+    "Permanents-Vacataires-ELT2-2026-2027.xlsx",
+    ("Permanents-Vacataires-ELT2-2026-2027(3).xlsx",),
+)
+FICHIER_EDT = choisir_fichier(
+    "dataEDT-ELT-S1-2027.xlsx",
+    ("dataEDT-ELT-S1-2027(5).xlsx",),
+)
+# Le fichier récent contient séparément « الاسم : » et « اللقب : ».
+FICHIER_COORD = choisir_fichier(
+    "Vos coordonnées en Arabe (réponses)(1).xlsx",
+    ("Vos coordonnées en Arabe (réponses).xlsx",),
+)
 FICHIER_TEMPLATE = BASE_DIR / "Etat_HSUP_Vacataire_2026_2027.xlsx"
 
 # Les blocs et lignes correspondent à la feuille « Nom & prénom » du modèle fourni.
@@ -112,23 +128,63 @@ def construire_cle_francaise(ligne, colonnes):
 
 
 def ajouter_correspondances_arabes(df, dict_arabe):
-    """Lit la colonne « Nom et prénom en arabe » et l'associe au nom français."""
+    """Associe les deux champs arabes à l'identité française de chaque vacataire.
+
+    Le formulaire récent fournit explicitement « الاسم : » et « اللقب : ».
+    Ces colonnes sont prioritaires et sont conservées séparément, sans les
+    inverser ni dépendre de l'ancienne colonne arabe regroupée.
+    """
     if df is None or df.empty:
         return
+
     colonnes = list(df.columns)
-    col_ar = next((c for c in colonnes if (
+    colonnes_norm = {normaliser_entete(c): c for c in colonnes}
+
+    # Identité française de référence : colonne complète du formulaire ou
+    # combinaison NOM + PRÉNOM du fichier du personnel.
+    col_fr = next((c for c in colonnes if normaliser_entete(c) in (
+        "nom et prenom en francais", "nom et prenom francais",
+        "nom prenom francais", "nom complet francais"
+    )), None)
+    col_ism = next((c for c in colonnes if nettoyer_texte(c) == "الاسم :"), None)
+    col_laqab = next((c for c in colonnes if nettoyer_texte(c) == "اللقب :"), None)
+
+    # Accepter les variantes d'espacement/ponctuation dans les en-têtes arabes.
+    if col_ism is None:
+        col_ism = next((c for c in colonnes if "الاسم" in nettoyer_texte(c)), None)
+    if col_laqab is None:
+        col_laqab = next((c for c in colonnes if "اللقب" in nettoyer_texte(c)), None)
+
+    # Compatibilité avec l'ancien formulaire : nom arabe en une seule cellule.
+    col_ar_complet = next((c for c in colonnes if (
         "nom et prenom en arabe" in normaliser_entete(c)
         or ("arabe" in normaliser_entete(c) and "nom" in normaliser_entete(c))
     )), None)
-    if col_ar is None:
-        col_ar = next((c for c in colonnes if "arabe" in normaliser_entete(c)), None)
-    if col_ar is None:
-        return
+
     for _, ligne in df.iterrows():
-        nom_fr = construire_cle_francaise(ligne, colonnes)
-        nom_ar = nettoyer_texte(ligne.get(col_ar, ""))
-        if nom_fr and nom_ar:
-            dict_arabe[normaliser_nom(nom_fr)] = nom_ar
+        nom_fr = nettoyer_texte(ligne.get(col_fr, "")) if col_fr else construire_cle_francaise(ligne, colonnes)
+        if not nom_fr:
+            continue
+
+        ism = nettoyer_texte(ligne.get(col_ism, "")) if col_ism else ""
+        laqab = nettoyer_texte(ligne.get(col_laqab, "")) if col_laqab else ""
+
+        # Ne recourir à l'ancienne colonne regroupée que si les deux nouvelles
+        # colonnes ne sont pas disponibles ou si elles sont vides sur cette ligne.
+        if (not ism and not laqab) and col_ar_complet:
+            complet = nettoyer_texte(ligne.get(col_ar_complet, ""))
+            parties = complet.split()
+            if len(parties) >= 2:
+                ism, laqab = parties[0], " ".join(parties[1:])
+            elif parties:
+                ism = parties[0]
+
+        if ism or laqab:
+            dict_arabe[normaliser_nom(nom_fr)] = {
+                "ism": ism,
+                "laqab": laqab,
+                "complet": " ".join(x for x in (ism, laqab) if x),
+            }
 
 
 def lire_heure(h):
@@ -201,15 +257,49 @@ def charger_donnees():
         lambda x: duree_seance_heures(x) if x else 0.0
     )
 
-    # Le nom arabe peut être présent dans le fichier du personnel ou dans
-    # le fichier des coordonnées. La colonne attendue est notamment
-    # « Nom et prénom en arabe ».
+    # Le fichier de réponses arabe est la source prioritaire pour les champs
+    # « الاسم : » et « اللقب : ». Le fichier du personnel et l'EDT servent à
+    # retrouver le même enseignant à partir de son nom français complet.
     dict_arabe = {}
     ajouter_correspondances_arabes(df_pv, dict_arabe)
     if FICHIER_COORD.exists():
         df_coord = pd.read_excel(FICHIER_COORD, dtype=str)
         df_coord.columns = [nettoyer_texte(c) for c in df_coord.columns]
+        # Les réponses les plus récentes prévalent en cas de doublon.
+        col_horodateur = next((c for c in df_coord.columns if "horodateur" in normaliser_entete(c)), None)
+        if col_horodateur:
+            df_coord = df_coord.sort_values(col_horodateur, kind="stable")
         ajouter_correspondances_arabes(df_coord, dict_arabe)
+
+        # Deuxième niveau de correspondance : l'adresse e-mail commune aux
+        # réponses et au fichier du personnel. Il corrige les variantes
+        # d'orthographe/ordre des noms français (ex. Mohammed/Mohamed).
+        def normaliser_email(valeur):
+            return re.sub(r"\s+", "", nettoyer_texte(valeur)).casefold()
+
+        col_email_coord = next((c for c in df_coord.columns
+                                if normaliser_entete(c) in ("adresse e mail", "email", "e mail")), None)
+        col_email_pv = next((c for c in df_pv.columns
+                             if normaliser_entete(c) in ("email", "e mail", "adresse e mail")), None)
+        if col_email_coord and col_email_pv:
+            arabe_par_email = {}
+            for _, ligne in df_coord.iterrows():
+                email = normaliser_email(ligne.get(col_email_coord, ""))
+                if not email:
+                    continue
+                ism = nettoyer_texte(ligne.get("الاسم :", ""))
+                laqab = nettoyer_texte(ligne.get("اللقب :", ""))
+                if ism or laqab:
+                    arabe_par_email[email] = {
+                        "ism": ism, "laqab": laqab,
+                        "complet": " ".join(x for x in (ism, laqab) if x),
+                    }
+            for _, ligne in df_pv.iterrows():
+                email = normaliser_email(ligne.get(col_email_pv, ""))
+                nom_pv = nettoyer_texte(ligne.get("NOM", ""))
+                if email in arabe_par_email and nom_pv:
+                    # Ne remplace pas une association directe déjà fiable.
+                    dict_arabe.setdefault(normaliser_nom(nom_pv), arabe_par_email[email])
 
     actifs = []
     for _, vac in df_vac.iterrows():
@@ -294,19 +384,14 @@ def remplir_fiche(ws, nom_vacataire, seances, dict_arabe, date_debut,
                   exclusions_par_mois):
     """Remplit une feuille du modèle officiel pour un seul enseignant."""
     nom_norm = normaliser_nom(nom_vacataire)
-    nom_arabe = dict_arabe.get(nom_norm, "")
-    prenom_ar = ""
-    nom_ar = ""
-    if nom_arabe:
-        parties = nom_arabe.split()
-        if len(parties) >= 2:
-            prenom_ar = parties[0]
-            nom_ar = " ".join(parties[1:])
-        elif parties:
-            prenom_ar = parties[0]
+    identite_arabe = dict_arabe.get(nom_norm, {})
+    ism_ar = nettoyer_texte(identite_arabe.get("ism", "")) if isinstance(identite_arabe, dict) else ""
+    laqab_ar = nettoyer_texte(identite_arabe.get("laqab", "")) if isinstance(identite_arabe, dict) else ""
 
-    ws["A7"] = f"الاسم : {prenom_ar}" if prenom_ar else "الاسم :"
-    ws["C7"] = f"اللقب : {nom_ar}" if nom_ar else "اللقب :"
+    # Respecter exactement les deux colonnes du formulaire, sans découpage
+    # automatique qui pourrait inverser ou tronquer les noms composés.
+    ws["A7"] = f"الاسم : {ism_ar}" if ism_ar else "الاسم :"
+    ws["C7"] = f"اللقب : {laqab_ar}" if laqab_ar else "اللقب :"
     ws["A8"] = "الرتبة :أستاذ مؤقت"
     ws["C8"] = "الهيئة المستخدمة الأصلية : الالكتروتقني"
 
@@ -516,7 +601,9 @@ def generer_excel_groupe(df_vacataires, df_edt, liste_enseignants, dict_arabe,
         total, details, heures_semaines = remplir_fiche(
             ws_fiche, nom, seances, dict_arabe, date_debut, exclusions_par_mois
         )
-        nom_arabe = dict_arabe.get(normaliser_nom(nom), "")
+        identite_arabe = dict_arabe.get(normaliser_nom(nom), {})
+        nom_arabe = (identite_arabe.get("complet", "")
+                     if isinstance(identite_arabe, dict) else nettoyer_texte(identite_arabe))
         types = seances["Enseignements"].apply(type_enseignement)
         heures_type = {
             t: float(seances.loc[types.eq(t), "DUREE_H"].sum())
@@ -641,19 +728,20 @@ try:
 
     st.divider()
     st.subheader(f"👨‍🏫 Fiche enseignant : {vacataire_select}")
-    nom_arabe = dict_noms_arabe.get(nom_norm, "Non renseigné")
-    if nom_arabe == "Non renseigné":
-        st.warning(
-            "Nom arabe introuvable pour cet enseignant. Vérifie que le fichier source "
-            "contient la colonne « Nom et prénom en arabe » et une colonne permettant "
-            "d'identifier le nom français correspondant. Les champs arabes resteront vides."
-        )
+    identite_arabe = dict_noms_arabe.get(nom_norm, {})
+    nom_arabe = (identite_arabe.get("complet", "")
+                 if isinstance(identite_arabe, dict) else nettoyer_texte(identite_arabe))
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Nom en arabe", nom_arabe)
+    c1.metric("Nom en arabe", nom_arabe or "Non renseigné")
     ligne_pv = df_vacataires[df_vacataires["NOM_NORM"].eq(nom_norm)].iloc[0]
     c2.metric("Grade", nettoyer_texte(ligne_pv.get("Grade", "")) or "Vacataire")
     c3.metric("Séances EDT", len(seances_vac))
     c4.metric("Volume hebdomadaire EDT", f"{seances_vac['DUREE_H'].sum():g} h")
+    if not nom_arabe:
+        st.warning(
+            "Aucune correspondance arabe exacte trouvée pour ce nom français. "
+            "Vérifie l'orthographe dans « Nom et prénom en francais » du formulaire."
+        )
 
     colonnes_aff = [
         c for c in ["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]

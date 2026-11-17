@@ -78,6 +78,11 @@ JOURS_FR = {
 }
 # Indexé par date.weekday() : 0 = lundi ... 6 = dimanche
 NOMS_JOURS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+# Noms inscrits par défaut sous les cases de signature de l'état H.SUP (modifiables dans la barre latérale)
+SIGNATAIRES = {
+    "naib_chef": "ناصور كمال",    # نائبي رئيس القسم
+    "chef": "ميلوى فريد",         # رئيس القسم
+}
 NOMS_JOURS_AR = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
 
 
@@ -503,6 +508,8 @@ def remplir_fiche(ws, nom_vacataire, seances, dict_arabe, date_debut,
         (copy.copy(ws["D28"]._style), ws["D28"].value),
     ]
     style_dir, texte_dir = copy.copy(ws["D40"]._style), ws["D40"].value
+    # style de la ligne « nom » placée sous chaque barre grise (D17 sous نائبي رئيس القسم, D22 sous رئيس القسم)
+    styles_noms_d = [copy.copy(ws["D17"]._style), copy.copy(ws["D22"]._style)]
 
     # Effacer l'ancien contenu du modèle (lignes 11 à 60), colonnes A à F.
     for ligne in range(11, 61):
@@ -577,6 +584,13 @@ def remplir_fiche(ws, nom_vacataire, seances, dict_arabe, date_debut,
     for pos, (style_case, texte_case) in zip(positions, cases_d):
         ws.cell(pos, 4)._style = copy.copy(style_case)
         ws.cell(pos, 4).value = texte_case
+    # Noms par défaut sous « نائبي رئيس القسم » (barre n° 2) et « رئيس القسم » (barre n° 3)
+    for pos, cle_nom, style_nom in ((positions[1], "naib_chef", styles_noms_d[0]),
+                                    (positions[2], "chef", styles_noms_d[1])):
+        nom_signataire = nettoyer_texte(SIGNATAIRES.get(cle_nom, ""))
+        if nom_signataire and pos + 1 <= ligne_total_general:
+            ws.cell(pos + 1, 4)._style = copy.copy(style_nom)
+            ws.cell(pos + 1, 4).value = nom_signataire
 
     # Directeur de l'université sous le cadre, puis note de calcul
     ws.cell(derniere_ligne_cadre + 1, 4)._style = copy.copy(style_dir)
@@ -1448,6 +1462,11 @@ try:
         f"Période comptabilisée : du {date_debut_cours.strftime('%d/%m/%Y')} "
         f"au {date_fin_comptabilisation.strftime('%d/%m/%Y')} inclus."
     )
+    st.sidebar.markdown("**✍️ Signataires de l'état H.SUP**")
+    SIGNATAIRES["naib_chef"] = st.sidebar.text_input(
+        "Nom sous « نائبي رئيس القسم »", value=SIGNATAIRES["naib_chef"], key="signataire_naib_chef")
+    SIGNATAIRES["chef"] = st.sidebar.text_input(
+        "Nom sous « رئيس القسم »", value=SIGNATAIRES["chef"], key="signataire_chef")
     vacataire_select = st.sidebar.selectbox(
         "Choisir un enseignant vacataire", liste_vacataires_actifs
     ) if liste_vacataires_actifs else None

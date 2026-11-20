@@ -1941,6 +1941,20 @@ def construire_exclusions_par_mois_admin(dates_exclues):
     return exclusions
 
 
+def extraire_noms_enseignants_edt(df_edt_source):
+    """Extrait les noms d'enseignants depuis la colonne Enseignants de l'EDT."""
+    noms = {}
+    for valeur in df_edt_source["Enseignants"].fillna("").astype(str):
+        for morceau in re.split(r"[,;]|\bet\b", valeur, flags=re.IGNORECASE):
+            nom = nettoyer_texte(morceau)
+            if not nom:
+                continue
+            cle = normaliser_nom(nom)
+            if cle and cle not in noms:
+                noms[cle] = nom
+    return [noms[cle] for cle in sorted(noms)]
+
+
 def construire_details_enseignants_historique(noms_enseignants, seances_par_enseignant=None):
     """Construit les détails par enseignant pour l'historique des générations."""
     seances_par_enseignant = seances_par_enseignant or {}
@@ -2822,10 +2836,13 @@ try:
         # ---- Etats des heures sups en Excel : un ou plusieurs enseignants ----
         st.markdown("#### 🗓️ Etats des heures sups en Excel (un ou plusieurs enseignants)")
         st.caption(
-            "Générez les états H.SUP Excel pour n'importe quel enseignant, "
-            "inscrit ou non inscrit. Les enseignants exclus administrativement "
-            "ne sont pas inclus. Pour les permanents, vous pouvez définir les "
-            "enseignements retenus comme H.SUP et les jours à exclure."
+            "Générez les états H.SUP Excel pour n'importe quel enseignant "
+            "présent dans l'EDT complet, inscrit ou non inscrit. Les enseignants "
+            "exclus administrativement ne sont pas inclus. Pour les permanents, "
+            "vous pouvez définir les enseignements retenus comme H.SUP et les "
+            "jours à exclure. Si aucun enseignement n'est retenu pour un "
+            "permanent, tous ses enseignements EDT sont utilisés dans la limite "
+            "des 7 heures équivalent-cours."
         )
 
         tous_hsup_excel = st.checkbox(
@@ -2833,9 +2850,11 @@ try:
             key="hsup_excel_tous",
         )
 
-        # Tous les enseignants actifs du fichier personnel, inscrits ou non.
+        # Tous les enseignants trouvés dans l'EDT complet, inscrits ou non.
+        enseignants_edt_complet = extraire_noms_enseignants_edt(df_edt_complet)
+
         enseignants_hsup_eligibles = [
-            n for n in liste_enseignants_actifs
+            n for n in enseignants_edt_complet
             if normaliser_nom(n) not in exclus_admin
         ]
 
@@ -2857,13 +2876,6 @@ try:
             key="hsup_excel_format",
         )
 
-        generer_sans_selection_admin = st.checkbox(
-            "Générer aussi les permanents sans sélection H.SUP enregistrée "
-            "(utiliser tous les enseignements EDT)",
-            value=False,
-            key="hsup_excel_sans_selection",
-        )
-
         choisis_hsup_excel = (
             set(enseignants_hsup_eligibles)
             if tous_hsup_excel
@@ -2871,7 +2883,7 @@ try:
         )
 
         selection_hsup_excel = [
-            n for n in liste_enseignants_actifs
+            n for n in enseignants_edt_complet
             if n in choisis_hsup_excel and normaliser_nom(n) not in exclus_admin
         ]
 
@@ -3001,15 +3013,19 @@ try:
                             df_enseignants["NOM_NORM"].eq(nom_norm_hsup_excel)
                         ]
 
-                        if ligne_hsup_excel.empty:
-                            continue
-
-                        qualite_hsup_excel = nettoyer_texte(
-                            ligne_hsup_excel.iloc[0].get("Qualité", "")
+                        # Un enseignant peut ne pas être encore inscrit ou ne pas
+                        # figurer dans le fichier personnel : on génère quand même.
+                        qualite_hsup_excel = (
+                            nettoyer_texte(
+                                ligne_hsup_excel.iloc[0].get("Qualité", "")
+                            )
+                            if not ligne_hsup_excel.empty
+                            else ""
                         ) or "Enseignant"
 
-                        seances_hsup_excel = df_edt[
-                            df_edt["Enseignants"].apply(
+                        # EDT complet : toutes les charges, tous départements.
+                        seances_hsup_excel = df_edt_complet[
+                            df_edt_complet["Enseignants"].apply(
                                 lambda x: correspond_enseignant(x, nom_norm_hsup_excel)
                             )
                         ].copy()
@@ -3027,10 +3043,9 @@ try:
                                 )
                             )
 
-                            if (
-                                not enseignements_retenus_hsup_excel
-                                and generer_sans_selection_admin
-                            ):
+                            # Si aucun enseignement n'est retenu, utiliser
+                            # automatiquement tous les enseignements EDT.
+                            if not enseignements_retenus_hsup_excel:
                                 enseignements_retenus_hsup_excel = sorted(
                                     {
                                         nettoyer_texte(x)
@@ -3068,7 +3083,8 @@ try:
                         st.session_state.pop("hsup_excel_pret", None)
                         st.warning(
                             "Aucun état H.SUP Excel ne peut être généré pour la sélection. "
-                            "Vérifiez les séances EDT et, pour les permanents, les enseignements H.SUP enregistrés."
+                            "Vérifiez que les enseignants sélectionnés ont des séances "
+                            "dans l'EDT complet et que leurs noms correspondent."
                         )
                     elif format_hsup_excel.startswith("Un fichier Excel par enseignant"):
 
@@ -3094,10 +3110,7 @@ try:
                                         )
                                     )
 
-                                    if (
-                                        not enseignements_retenus_fiche_hsup_excel
-                                        and generer_sans_selection_admin
-                                    ):
+                                    if not enseignements_retenus_fiche_hsup_excel:
                                         enseignements_retenus_fiche_hsup_excel = sorted(
                                             {
                                                 nettoyer_texte(x)

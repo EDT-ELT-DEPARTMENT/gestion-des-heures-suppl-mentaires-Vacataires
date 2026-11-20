@@ -504,15 +504,85 @@ def dedoublonner_seances_simultanees(seances):
     return travail.drop(columns=["_TYPE_HSUP", "_HORAIRE_HSUP", "_CLE_SIMULTANEE"], errors="ignore")
 
 
+SEPARATEUR_CRENEAU_HSUP = " ▸ "
+
+
+def _norm_creneau_hsup(texte):
+    return re.sub(r"\s+", "", nettoyer_texte(texte)).casefold()
+
+
+def libelle_creneau_hsup(enseignement, jour, horaire):
+    """Libellé d'un enseignement distingué par son créneau (jour + horaire)."""
+    creneau = " ".join(x for x in (nettoyer_texte(jour), nettoyer_texte(horaire)) if x)
+    ens = nettoyer_texte(enseignement)
+    return f"{ens}{SEPARATEUR_CRENEAU_HSUP}{creneau}" if creneau else ens
+
+
+def ajouter_libelles_creneaux_hsup(seances):
+    """Retourne une copie des séances avec la colonne _LIBELLE_HSUP (enseignement + créneau)."""
+    travail = seances.copy()
+    if travail.empty:
+        travail["_LIBELLE_HSUP"] = []
+        return travail
+    jours = travail["Jours"] if "Jours" in travail.columns else [""] * len(travail)
+    travail["_LIBELLE_HSUP"] = [
+        libelle_creneau_hsup(e, j, h)
+        for e, j, h in zip(travail["Enseignements"], jours, travail["Horaire"])
+    ]
+    return travail
+
+
+def options_enseignements_hsup(seances):
+    """Liste déroulante H.SUP : un choix par enseignement ET par créneau distinct.
+
+    Un même enseignement placé sur deux créneaux différents apparaît donc deux fois.
+    Les promotions différentes sur un même créneau restent un seul choix.
+    """
+    if seances is None or seances.empty:
+        return []
+    libelles = ajouter_libelles_creneaux_hsup(seances)["_LIBELLE_HSUP"]
+    vus, options = set(), []
+    for lib in libelles:
+        cle = _norm_creneau_hsup(lib)
+        if lib and cle not in vus:
+            vus.add(cle)
+            options.append(lib)
+    return sorted(options, key=lambda x: x.casefold())
+
+
+def selections_vers_options_hsup(selections, options):
+    """Convertit des sélections enregistrées vers les options affichées.
+
+    Compatible avec les anciennes sélections (nom d'enseignement seul) : elles
+    sélectionnent alors tous les créneaux de cet enseignement.
+    """
+    selections_norm = {_norm_creneau_hsup(x) for x in (selections or []) if nettoyer_texte(x)}
+    resultat = []
+    for opt in options:
+        nom_seul = opt.split(SEPARATEUR_CRENEAU_HSUP)[0]
+        if _norm_creneau_hsup(opt) in selections_norm or _norm_creneau_hsup(nom_seul) in selections_norm:
+            resultat.append(opt)
+    return resultat
+
+
 def filtrer_enseignements_hsup(seances, qualite_enseignant, enseignements_retenus=None):
-    """Pour les permanents, ne conserve que les enseignements désignés comme H.SUP."""
+    """Pour les permanents, ne conserve que les enseignements/créneaux désignés comme H.SUP.
+
+    Une sélection peut être un enseignement seul (tous ses créneaux) ou un
+    enseignement + créneau précis (« Enseignement ▸ Jour Horaire »).
+    """
     est_permanent = "permanent" in nettoyer_texte(qualite_enseignant).casefold()
     if not est_permanent:
         return seances.copy()
-    retenus = {nettoyer_texte(x) for x in (enseignements_retenus or []) if nettoyer_texte(x)}
-    if not retenus:
+    retenus = {_norm_creneau_hsup(x) for x in (enseignements_retenus or []) if nettoyer_texte(x)}
+    if not retenus or seances.empty:
         return seances.iloc[0:0].copy()
-    return seances[seances["Enseignements"].apply(nettoyer_texte).isin(retenus)].copy()
+    avec_libelles = ajouter_libelles_creneaux_hsup(seances)
+    masque = [
+        _norm_creneau_hsup(lib) in retenus or _norm_creneau_hsup(ens) in retenus
+        for lib, ens in zip(avec_libelles["_LIBELLE_HSUP"], avec_libelles["Enseignements"])
+    ]
+    return seances[pd.Series(masque, index=seances.index)].copy()
 
 
 def calculer_charge_equivalente_hebdomadaire(seances):
@@ -2650,7 +2720,7 @@ try:
             "Cette sélection ne modifie pas l'emploi du temps affiché."
         )
         metadata_hsup = profil_compte.get("user_metadata") or {}
-        options_hsup = sorted({nettoyer_texte(x) for x in seances_enseignant["Enseignements"] if nettoyer_texte(x)})
+        options_hsup = options_enseignements_hsup(seances_enseignant)
         deja_hsup = metadata_hsup.get("hsup_enseignements_retenus", []) or []
         user_id_local = (profil_compte or {}).get("id")
         if user_id_local:
@@ -2661,7 +2731,7 @@ try:
             )
             if not err_local and prefs_local:
                 deja_hsup = prefs_local[0].get("selected_teachings") or []
-        deja_hsup = [x for x in deja_hsup if x in options_hsup]
+        deja_hsup = selections_vers_options_hsup(deja_hsup, options_hsup)
         enseignements_hsup_selectionnes = st.multiselect(
             "Enseignements retenus comme H.SUP (permanent uniquement)",
             options=options_hsup, default=deja_hsup, key="hsup_enseignements_selection"
@@ -2970,13 +3040,8 @@ try:
             if seances_reglage.empty:
                 continue
 
-            options_enseignements_reglage = sorted(
-                {
-                    nettoyer_texte(x)
-                    for x in seances_reglage["Enseignements"]
-                    if nettoyer_texte(x)
-                }
-            )
+            # Un choix par enseignement ET par créneau (jour + horaire) distinct.
+            options_enseignements_reglage = options_enseignements_hsup(seances_reglage)
 
             with st.expander(
                 f"⚙️ Réglages H.SUP — {nom_reglage}",
@@ -3000,8 +3065,14 @@ try:
                     selections_reglage = st.multiselect(
                         "Enseignements retenus comme H.SUP",
                         options=options_enseignements_reglage,
-                        default=reglages_admin_selections.get(
-                            nom_norm_reglage, []
+                        default=selections_vers_options_hsup(
+                            reglages_admin_selections.get(nom_norm_reglage, []),
+                            options_enseignements_reglage,
+                        ),
+                        help=(
+                            "Un même enseignement placé sur deux créneaux différents "
+                            "apparaît deux fois : choisissez le(s) créneau(x) à "
+                            "comptabiliser en H.SUP."
                         ),
                         key=f"hsup_admin_enseignements_{nom_norm_reglage}",
                     )

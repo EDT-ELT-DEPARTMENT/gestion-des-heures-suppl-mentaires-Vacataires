@@ -2833,9 +2833,9 @@ try:
             key="hsup_excel_tous",
         )
 
-        # Tous les enseignants du fichier personnel, inscrits ou non.
+        # Tous les enseignants actifs du fichier personnel, inscrits ou non.
         enseignants_hsup_eligibles = [
-            n for n in liste_enseignants
+            n for n in liste_enseignants_actifs
             if normaliser_nom(n) not in exclus_admin
         ]
 
@@ -2871,7 +2871,7 @@ try:
         )
 
         selection_hsup_excel = [
-            n for n in liste_enseignants
+            n for n in liste_enseignants_actifs
             if n in choisis_hsup_excel and normaliser_nom(n) not in exclus_admin
         ]
 

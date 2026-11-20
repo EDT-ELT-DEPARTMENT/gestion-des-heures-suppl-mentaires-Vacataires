@@ -2472,6 +2472,22 @@ def generer_edt_sans_suppressions(indices_a_supprimer, modifications_enseignants
         return sortie
 
 
+def construire_liste_edt_apres_plan(df_edt_modifie, df_enseignants, noms_norm):
+    """[(nom, qualité, séances)] des enseignants indiqués, d'après l'EDT modifié (grille PDF)."""
+    liste = []
+    for nn in noms_norm:
+        seances = df_edt_modifie[
+            df_edt_modifie["Enseignants"].apply(lambda x, n=nn: correspond_enseignant(x, n))
+        ].copy()
+        if seances.empty:
+            continue
+        ligne = df_enseignants[df_enseignants["NOM_NORM"].eq(nn)]
+        nom = nettoyer_texte(ligne.iloc[0].get("NOM", "")) if not ligne.empty else nn
+        qualite = (nettoyer_texte(ligne.iloc[0].get("Qualité", "")) if not ligne.empty else "") or "Enseignant"
+        liste.append((nom or nn, qualite, seances))
+    return liste
+
+
 def effacer_historique_generations():
     """Supprime toutes les lignes de l'historique des générations (admin, service_role)."""
     _, erreur = _supabase_table_requete(
@@ -3492,6 +3508,39 @@ try:
                         use_container_width=True,
                         key="download_edt_mis_a_jour",
                     )
+                    # Nouvel EDT en grille PDF (même forme que la grille individuelle d'origine).
+                    impactes = set(validees.keys())
+                    for d in plan_final["details"]:
+                        if str(d.get("Décision", "")).startswith("Supprimée aussi"):
+                            impactes.add(normaliser_nom(d["Co-enseignant"]))
+                    df_edt_modifie_grille = appliquer_plan_edt(df_edt_complet, plan_final)
+                    liste_grille = construire_liste_edt_apres_plan(
+                        df_edt_modifie_grille, df_enseignants, sorted(impactes)
+                    )
+                    if liste_grille:
+                        try:
+                            st.download_button(
+                                label=f"📥 Télécharger le nouvel EDT en grille (PDF, {len(liste_grille)} enseignant(s))",
+                                data=generer_pdf_edt(liste_grille).getvalue(),
+                                file_name=(
+                                    nom_fichier_edt(liste_grille[0][0]).replace(".pdf", "_modifie.pdf")
+                                    if len(liste_grille) == 1 else "EDT_modifies_grille.pdf"
+                                ),
+                                mime="application/pdf",
+                                use_container_width=True,
+                                key="download_edt_grille_modifie",
+                            )
+                            if len(liste_grille) > 1:
+                                st.download_button(
+                                    label="📥 Un PDF en grille par enseignant (ZIP)",
+                                    data=generer_zip_edt(liste_grille).getvalue(),
+                                    file_name="EDT_modifies_grille.zip",
+                                    mime="application/zip",
+                                    use_container_width=True,
+                                    key="download_edt_grille_modifie_zip",
+                                )
+                        except Exception as exc_grille:
+                            st.error(f"Impossible de générer la grille PDF : {exc_grille}")
                     st.caption(
                         "Pour que les états H.SUP utilisent ce nouvel EDT, remplacez le fichier EDT "
                         "d'origine du dépôt par ce fichier, puis redémarrez l'application."

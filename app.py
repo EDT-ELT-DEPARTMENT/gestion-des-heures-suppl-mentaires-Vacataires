@@ -867,7 +867,8 @@ def nom_onglet_unique(nom, deja_utilises):
 
 def generer_excel_groupe(df_enseignants, df_edt, liste_enseignants, dict_arabe,
                          date_debut, date_fin, exclusions_par_mois,
-                         selections_hsup_par_enseignant=None):
+                         selections_hsup_par_enseignant=None,
+                         exclusions_par_mois_par_enseignant=None):
     """
     Crée un seul classeur : index cliquable, récapitulatif, puis une fiche
     officielle par enseignant (une feuille par enseignant).
@@ -961,9 +962,14 @@ def generer_excel_groupe(df_enseignants, df_edt, liste_enseignants, dict_arabe,
                 seances, choix_hsup, seuil=7.0
             )
         # Les vacataires gardent le calcul de leurs séances réelles.
+        exclusions_fiche = exclusions_par_mois
+        if exclusions_par_mois_par_enseignant:
+            exclusions_fiche = exclusions_par_mois_par_enseignant.get(
+                normaliser_nom(nom), exclusions_par_mois
+            )
         total, details, heures_mois = remplir_fiche(
             ws_fiche, nom, seances, dict_arabe, date_debut, date_fin,
-            exclusions_par_mois, qualite_fiche
+            exclusions_fiche, qualite_fiche
         )
         identite_arabe = identite_arabe_de(dict_arabe, nom)
         nom_arabe = (identite_arabe.get("complet", "")
@@ -1863,6 +1869,78 @@ def enregistrer_coordonnees_enseignant(
     return (erreur is None), (erreur or "")
 
 
+def charger_reglages_admin_enseignants():
+    """Charge les réglages administratifs des enseignants (H.SUP et jours exclus)."""
+    resultat, erreur = _supabase_table_requete(
+        "hsup_admin_teacher_settings",
+        "GET",
+        params=(
+            "select=teacher_name,selected_teachings,excluded_dates"
+            "&order=teacher_name.asc"
+        ),
+        admin=True,
+    )
+
+    selections = {}
+    dates_exclues = {}
+
+    for ligne in resultat or []:
+        nom = normaliser_nom(ligne.get("teacher_name", ""))
+        if not nom:
+            continue
+        selections[nom] = ligne.get("selected_teachings") or []
+        dates_brutes = ligne.get("excluded_dates") or []
+        dates_converties = []
+        for d in dates_brutes:
+            try:
+                dates_converties.append(
+                    d if isinstance(d, date) else date.fromisoformat(str(d))
+                )
+            except (TypeError, ValueError):
+                continue
+        dates_exclues[nom] = dates_converties
+
+    return selections, dates_exclues, erreur
+
+
+def enregistrer_reglages_admin_enseignant(nom_enseignant, selections, dates_exclues):
+    """Enregistre les réglages administratifs d'un enseignant dans Supabase."""
+    nom_norm = normaliser_nom(nom_enseignant)
+    if not nom_norm:
+        return False, "Nom d'enseignant absent."
+
+    dates_iso = sorted(
+        d.isoformat() for d in (dates_exclues or []) if isinstance(d, date)
+    )
+
+    payload = {
+        "teacher_name": nom_norm,
+        "selected_teachings": list(selections or []),
+        "excluded_dates": dates_iso,
+    }
+
+    _, erreur = _supabase_table_requete(
+        "hsup_admin_teacher_settings",
+        "POST",
+        payload,
+        "on_conflict=teacher_name",
+        admin=True,
+    )
+    return (erreur is None), (erreur or "")
+
+
+def construire_exclusions_par_mois_admin(dates_exclues):
+    """Convertit une liste de dates exclues en dictionnaire par mois."""
+    exclusions = {}
+    for d in dates_exclues or []:
+        try:
+            d_date = d if isinstance(d, date) else date.fromisoformat(str(d))
+        except (TypeError, ValueError):
+            continue
+        exclusions.setdefault(d_date.month, set()).add(d_date)
+    return exclusions
+
+
 def construire_details_enseignants_historique(noms_enseignants, seances_par_enseignant=None):
     """Construit les détails par enseignant pour l'historique des générations."""
     seances_par_enseignant = seances_par_enseignant or {}
@@ -2744,9 +2822,10 @@ try:
         # ---- Etats des heures sups en Excel : un ou plusieurs enseignants ----
         st.markdown("#### 🗓️ Etats des heures sups en Excel (un ou plusieurs enseignants)")
         st.caption(
-            "Générez les états H.SUP Excel pour un ou plusieurs enseignants. "
-            "Les enseignants exclus administrativement ne sont pas inclus. "
-            "Pour les permanents, seuls les enseignements déclarés H.SUP dans Supabase sont retenus."
+            "Générez les états H.SUP Excel pour n'importe quel enseignant, "
+            "inscrit ou non inscrit. Les enseignants exclus administrativement "
+            "ne sont pas inclus. Pour les permanents, vous pouvez définir les "
+            "enseignements retenus comme H.SUP et les jours à exclure."
         )
 
         tous_hsup_excel = st.checkbox(
@@ -2754,8 +2833,9 @@ try:
             key="hsup_excel_tous",
         )
 
+        # Tous les enseignants du fichier personnel, inscrits ou non.
         enseignants_hsup_eligibles = [
-            n for n in liste_enseignants_actifs
+            n for n in liste_enseignants
             if normaliser_nom(n) not in exclus_admin
         ]
 
@@ -2791,13 +2871,105 @@ try:
         )
 
         selection_hsup_excel = [
-            n for n in liste_enseignants_actifs
+            n for n in liste_enseignants
             if n in choisis_hsup_excel and normaliser_nom(n) not in exclus_admin
         ]
 
         st.caption(
             f"{len(selection_hsup_excel)} enseignant(s) sélectionné(s) pour les états H.SUP Excel."
         )
+
+        # Réglages administratifs : enseignements H.SUP et jours exclus.
+        reglages_admin_selections, reglages_admin_dates, erreur_reglages_admin = (
+            charger_reglages_admin_enseignants()
+        )
+
+        if erreur_reglages_admin:
+            st.error(
+                "Impossible de charger les réglages administratifs : "
+                + erreur_reglages_admin
+            )
+
+        dates_periode_admin = []
+        if date_debut_cours and date_fin_comptabilisation:
+            d = date_debut_cours
+            while d <= date_fin_comptabilisation:
+                dates_periode_admin.append(d)
+                d += timedelta(days=1)
+
+        for nom_reglage in selection_hsup_excel:
+            nom_norm_reglage = normaliser_nom(nom_reglage)
+            ligne_reglage = df_enseignants[
+                df_enseignants["NOM_NORM"].eq(nom_norm_reglage)
+            ]
+            qualite_reglage = (
+                nettoyer_texte(ligne_reglage.iloc[0].get("Qualité", ""))
+                if not ligne_reglage.empty
+                else ""
+            ) or "Enseignant"
+
+            if "permanent" not in qualite_reglage.casefold():
+                continue
+
+            seances_reglage = df_edt[
+                df_edt["Enseignants"].apply(
+                    lambda x: correspond_enseignant(x, nom_norm_reglage)
+                )
+            ].copy()
+
+            if seances_reglage.empty:
+                continue
+
+            options_enseignements_reglage = sorted(
+                {
+                    nettoyer_texte(x)
+                    for x in seances_reglage["Enseignements"]
+                    if nettoyer_texte(x)
+                }
+            )
+
+            with st.expander(
+                f"⚙️ Réglages H.SUP — {nom_reglage} (permanent)",
+                expanded=False,
+            ):
+                selections_reglage = st.multiselect(
+                    "Enseignements retenus comme H.SUP",
+                    options=options_enseignements_reglage,
+                    default=reglages_admin_selections.get(
+                        nom_norm_reglage, []
+                    ),
+                    key=f"hsup_admin_enseignements_{nom_norm_reglage}",
+                )
+
+                dates_exclues_reglage = st.multiselect(
+                    "Jours à exclure du calcul H.SUP",
+                    options=dates_periode_admin,
+                    default=reglages_admin_dates.get(
+                        nom_norm_reglage, []
+                    ),
+                    format_func=lambda d: d.strftime("%d/%m/%Y"),
+                    key=f"hsup_admin_dates_{nom_norm_reglage}",
+                )
+
+                if st.button(
+                    f"💾 Enregistrer les réglages de {nom_reglage}",
+                    key=f"hsup_admin_save_{nom_norm_reglage}",
+                    use_container_width=True,
+                ):
+                    ok_reglage, erreur_reglage = enregistrer_reglages_admin_enseignant(
+                        nom_reglage,
+                        selections_reglage,
+                        dates_exclues_reglage,
+                    )
+                    if ok_reglage:
+                        st.success(
+                            f"Réglages enregistrés pour {nom_reglage}."
+                        )
+                        st.rerun()
+                    else:
+                        st.error(
+                            "Enregistrement impossible : " + erreur_reglage
+                        )
 
         if st.button(
             "🗓️ Préparer les états H.SUP Excel",
@@ -2847,6 +3019,9 @@ try:
                         if "permanent" in qualite_hsup_excel.casefold():
                             enseignements_retenus_hsup_excel = (
                                 preferences_admin_hsup_excel.get(
+                                    nom_norm_hsup_excel, []
+                                )
+                                or reglages_admin_selections.get(
                                     nom_norm_hsup_excel, []
                                 )
                             )
@@ -2912,6 +3087,10 @@ try:
                                             normaliser_nom(nom_fiche_hsup_excel),
                                             [],
                                         )
+                                        or reglages_admin_selections.get(
+                                            normaliser_nom(nom_fiche_hsup_excel),
+                                            [],
+                                        )
                                     )
 
                                     if (
@@ -2939,6 +3118,15 @@ try:
                                 if seances_fiche_hsup_excel.empty:
                                     continue
 
+                                exclusions_fiche_hsup_excel = (
+                                    construire_exclusions_par_mois_admin(
+                                        reglages_admin_dates.get(
+                                            normaliser_nom(nom_fiche_hsup_excel),
+                                            [],
+                                        )
+                                    )
+                                )
+
                                 buffer_fiche_hsup_excel, total_fiche_hsup_excel, details_fiche_hsup_excel = (
                                     generer_excel(
                                         nom_fiche_hsup_excel,
@@ -2946,7 +3134,7 @@ try:
                                         dict_noms_arabe,
                                         date_debut_cours,
                                         date_fin_comptabilisation,
-                                        exclusions_par_mois,
+                                        exclusions_fiche_hsup_excel,
                                         qualite_fiche_hsup_excel,
                                     )
                                 )
@@ -2992,6 +3180,18 @@ try:
                             seances_par_enseignant=seances_par_enseignant_hsup_excel,
                         )
 
+                        exclusions_par_enseignant_hsup_excel = {
+                            normaliser_nom(nom_hsup_excel): (
+                                construire_exclusions_par_mois_admin(
+                                    reglages_admin_dates.get(
+                                        normaliser_nom(nom_hsup_excel),
+                                        [],
+                                    )
+                                )
+                            )
+                            for nom_hsup_excel in selection_hsup_excel
+                        }
+
                         buffer_hsup_excel, nombre_fiches_hsup_excel = generer_excel_groupe(
                             df_enseignants,
                             df_edt,
@@ -3001,6 +3201,7 @@ try:
                             date_fin_comptabilisation,
                             exclusions_par_mois,
                             selections_hsup_par_enseignant=preferences_admin_hsup_excel,
+                            exclusions_par_mois_par_enseignant=exclusions_par_enseignant_hsup_excel,
                         )
 
                         st.session_state["hsup_excel_pret"] = {
@@ -3049,6 +3250,10 @@ try:
                 liste_a_generer = [n for n in liste_enseignants_actifs
                                    if normaliser_nom(n) not in exclus_admin]
 
+                reglages_admin_selections_groupe, reglages_admin_dates_groupe, _ = (
+                    charger_reglages_admin_enseignants()
+                )
+
                 seances_par_enseignant_groupe = {}
                 for nom_groupe in liste_a_generer:
                     nom_norm_groupe = normaliser_nom(nom_groupe)
@@ -3065,10 +3270,26 @@ try:
                     seances_par_enseignant=seances_par_enseignant_groupe,
                 )
 
+                selections_hsup_effectives = {}
+                exclusions_par_enseignant_groupe = {}
+
+                for nom_groupe in liste_a_generer:
+                    nom_norm_groupe = normaliser_nom(nom_groupe)
+                    selections_hsup_effectives[nom_norm_groupe] = (
+                        preferences_admin.get(nom_norm_groupe, [])
+                        or reglages_admin_selections_groupe.get(nom_norm_groupe, [])
+                    )
+                    exclusions_par_enseignant_groupe[nom_norm_groupe] = (
+                        construire_exclusions_par_mois_admin(
+                            reglages_admin_dates_groupe.get(nom_norm_groupe, [])
+                        )
+                    )
+
                 buffer_groupe, nb_fiches = generer_excel_groupe(
                     df_enseignants, df_edt, liste_a_generer, dict_noms_arabe,
                     date_debut_cours, date_fin_comptabilisation, exclusions_par_mois,
-                    selections_hsup_par_enseignant=preferences_admin
+                    selections_hsup_par_enseignant=selections_hsup_effectives,
+                    exclusions_par_mois_par_enseignant=exclusions_par_enseignant_groupe,
                 )
 
             st.success(f"Classeur groupé généré : {nb_fiches} fiches individuelles.")

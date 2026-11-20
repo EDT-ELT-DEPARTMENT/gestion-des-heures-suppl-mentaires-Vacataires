@@ -1658,6 +1658,171 @@ def lire_date_compte(valeur, defaut):
     except (TypeError, ValueError):
         return defaut
 
+def afficher_espace_personnel(prefixe, enseignant_select, nom_norm, seances_enseignant,
+                              df_enseignants, dict_noms_arabe, profil_compte,
+                              date_debut_cours, date_fin_comptabilisation,
+                              exclusions_par_mois, etiquette_fichier="Enseignant"):
+    """Affiche TOUTES les fonctionnalités du compte enseignant pour la personne connectée :
+    fiche enseignant, identité arabe + téléphone, séances EDT, EDT individuel (PDF) et
+    état H.SUP officiel (Excel). Utilisée à l'identique par l'espace enseignant et par
+    l'espace administration (le préfixe garantit des clés de widgets uniques)."""
+    st.subheader(f"👨‍🏫 Fiche enseignant : {enseignant_select}")
+    identite_arabe, mode_arabe, cle_arabe = trouver_identite_arabe(dict_noms_arabe, enseignant_select)
+    metadata_compte = profil_compte.get("user_metadata") or {}
+    ism_arabe = nettoyer_texte(metadata_compte.get("ism_arabe", "")) or nettoyer_texte(
+        identite_arabe.get("ism", "") if isinstance(identite_arabe, dict) else ""
+    )
+    laqab_arabe = nettoyer_texte(metadata_compte.get("laqab_arabe", "")) or nettoyer_texte(
+        identite_arabe.get("laqab", "") if isinstance(identite_arabe, dict) else ""
+    )
+    nom_arabe = " ".join(x for x in (ism_arabe, laqab_arabe) if x)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Nom en arabe", nom_arabe or "Non renseigné")
+    ligne_pv = df_enseignants[df_enseignants["NOM_NORM"].eq(nom_norm)].iloc[0]
+    c2.metric(
+        "Qualité / Grade",
+        " — ".join(x for x in (
+            nettoyer_texte(ligne_pv.get("Qualité", "")),
+            nettoyer_texte(ligne_pv.get("Grade", ""))
+        ) if x) or "Non renseigné"
+    )
+    c3.metric("Séances EDT", len(seances_enseignant))
+    c4.metric("Volume hebdomadaire EDT", f"{seances_enseignant['DUREE_H'].sum():g} h")
+    if not nom_arabe:
+        st.warning(
+            "Le fichier source ne contient pas encore le nom et le prénom en arabe. "
+            "Renseignez-les ci-dessous pour compléter votre fiche H.SUP."
+        )
+    telephone_compte = nettoyer_texte(metadata_compte.get("telephone", ""))
+    with st.form(f"{prefixe}_hsup_identite_arabe_form"):
+        col_ism, col_laqab = st.columns(2)
+        ism_saisi = col_ism.text_input(
+            "الاسم — prénom en arabe (obligatoire)", value=ism_arabe, key=f"{prefixe}_ism_saisi"
+        )
+        laqab_saisi = col_laqab.text_input(
+            "اللقب — nom en arabe (obligatoire)", value=laqab_arabe, key=f"{prefixe}_laqab_saisi"
+        )
+        telephone_saisi = st.text_input(
+            "Numéro de téléphone (obligatoire)", value=telephone_compte,
+            placeholder="Ex. : 0550123456 ou +213550123456", max_chars=20,
+            key=f"{prefixe}_telephone_saisi"
+        )
+        sauvegarder_arabe = st.form_submit_button("Enregistrer mes renseignements personnels")
+    if sauvegarder_arabe:
+        telephone_nettoye = re.sub(r"[\s().-]", "", telephone_saisi.strip())
+        telephone_chiffres = re.sub(r"\D", "", telephone_nettoye)
+        champs_arabes_valides = (
+            bool(re.search(r"[\u0600-\u06FF]", ism_saisi))
+            and bool(re.search(r"[\u0600-\u06FF]", laqab_saisi))
+        )
+        if not champs_arabes_valides:
+            st.error("Le prénom et le nom doivent être renseignés en caractères arabes.")
+        elif len(telephone_chiffres) < 8 or len(telephone_chiffres) > 15:
+            st.error("Le numéro de téléphone est obligatoire et doit contenir entre 8 et 15 chiffres.")
+        else:
+            ok, erreur = enregistrer_identite_enseignant_compte(
+                ism_saisi.strip(), laqab_saisi.strip(), telephone_nettoye
+            )
+            if ok:
+                st.success("Vos renseignements personnels ont été enregistrés dans votre compte.")
+                st.rerun()
+            else:
+                st.error(f"Enregistrement impossible : {erreur}")
+    dict_noms_arabe[normaliser_nom(enseignant_select)] = {
+        "ism": ism_saisi.strip() if 'ism_saisi' in locals() else ism_arabe,
+        "laqab": laqab_saisi.strip() if 'laqab_saisi' in locals() else laqab_arabe,
+        "complet": " ".join(x for x in (
+            ism_saisi.strip() if 'ism_saisi' in locals() else ism_arabe,
+            laqab_saisi.strip() if 'laqab_saisi' in locals() else laqab_arabe
+        ) if x)
+    }
+    if mode_arabe != "exacte" and nom_arabe:
+        libelles_mode = {
+            "ordre": "mêmes mots dans un autre ordre",
+            "orthographe": "orthographe légèrement différente (lettres doublées)",
+            "approchee": "orthographe proche",
+            "partielle": "nom incomplet d'un côté",
+        }
+        st.info(
+            f"Correspondance du formulaire arabe : « {enseignant_select} » ↔ « {cle_arabe} » "
+            f"({libelles_mode.get(mode_arabe, mode_arabe)}). Vérifiez que c'est bien le même enseignant."
+        )
+
+    colonnes_aff = [
+        c for c in ["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]
+        if c in seances_enseignant.columns
+    ]
+    st.markdown("### Séances hebdomadaires issues de l'EDT")
+    if seances_enseignant.empty:
+        st.warning(
+            "Aucune séance n'a été trouvée pour votre nom dans le fichier EDT. "
+            "Vérifiez la correspondance de votre identité dans le fichier source."
+        )
+    st.dataframe(seances_enseignant[colonnes_aff], use_container_width=True, hide_index=True)
+
+    # ---- Emploi du temps individuel en grille (PDF, dimensions du modèle PPER.03) ----
+    st.markdown("### 🗓️ Emploi du temps individuel (grille PDF)")
+    qualite_select = nettoyer_texte(ligne_pv.get("Qualité", "")) or "Enseignant"
+    if trouver_logo() is None:
+        st.info(
+            "logo.PNG introuvable à côté de app.py : le logo intégré de l'université est utilisé. "
+            "Pour utiliser le vôtre, placez logo.PNG à la racine du dépôt GitHub."
+        )
+    st.download_button(
+        label="📥 Télécharger l'emploi du temps individuel (PDF)",
+        data=generer_pdf_edt([(enseignant_select, qualite_select, seances_enseignant)]),
+        file_name=nom_fichier_edt(enseignant_select),
+        mime="application/pdf",
+        use_container_width=True,
+        key=f"{prefixe}_download_edt_individuel",
+    )
+
+    erreurs_horaires = seances_enseignant[
+        seances_enseignant["DUREE_H"].isna()
+    ] if "DUREE_H" in seances_enseignant.columns else pd.DataFrame()
+    if not erreurs_horaires.empty:
+        st.error("Certaines séances ont un horaire non interprétable. Corrige la source EDT.")
+
+    # ---- État H.SUP officiel individuel ----
+    st.markdown("### 📊 État individuel des heures supplémentaires (Excel officiel)")
+    st.caption(
+        f"Période : du {date_debut_cours.strftime('%d/%m/%Y')} "
+        f"au {date_fin_comptabilisation.strftime('%d/%m/%Y')} inclus."
+    )
+    cle_etat = f"{prefixe}_etat_pret"
+    if st.button("🚀 Générer l'état Excel officiel actualisé", type="primary",
+                 use_container_width=True, key=f"{prefixe}_generer_etat"):
+        buffer, total_general, details = generer_excel(
+            enseignant_select, seances_enseignant, dict_noms_arabe,
+            date_debut_cours, date_fin_comptabilisation, exclusions_par_mois,
+            qualite_select
+        )
+        nom_fichier_clean = normaliser_nom(enseignant_select).replace(" ", "_")
+        st.session_state[cle_etat] = {
+            "data": buffer.getvalue(),
+            "total": total_general,
+            "details": details,
+            "nom": f"Etat_HSUP_{etiquette_fichier}_{nom_fichier_clean}_2026_2027.xlsx",
+        }
+
+    etat_pret = st.session_state.get(cle_etat)
+    if etat_pret:
+        st.success(
+            f"État Excel généré. Total calculé sur les dates admissibles : "
+            f"{format_heures_arabe(etat_pret['total']) or '0سا'}."
+        )
+        st.download_button(
+            label="📥 Télécharger l'état Excel actualisé",
+            data=etat_pret["data"],
+            file_name=etat_pret["nom"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"{prefixe}_download_etat",
+        )
+        st.markdown("#### Vérification du calcul jour par jour")
+        st.dataframe(pd.DataFrame(etat_pret["details"]), use_container_width=True, hide_index=True)
+
+
 try:
     df_enseignants, df_edt, dict_noms_arabe, liste_enseignants_actifs = charger_donnees()
     enseignant_connecte, est_administrateur, profil_compte = authentifier_enseignant(
@@ -1767,136 +1932,15 @@ try:
         else:
             st.error(f"Impossible d'enregistrer vos paramètres : {erreur_cal}")
 
-    st.divider()
-    st.subheader(f"👨‍🏫 Fiche enseignant : {enseignant_select}")
-    identite_arabe, mode_arabe, cle_arabe = trouver_identite_arabe(dict_noms_arabe, enseignant_select)
-    metadata_compte = profil_compte.get("user_metadata") or {}
-    ism_arabe = nettoyer_texte(metadata_compte.get("ism_arabe", "")) or nettoyer_texte(
-        identite_arabe.get("ism", "") if isinstance(identite_arabe, dict) else ""
-    )
-    laqab_arabe = nettoyer_texte(metadata_compte.get("laqab_arabe", "")) or nettoyer_texte(
-        identite_arabe.get("laqab", "") if isinstance(identite_arabe, dict) else ""
-    )
-    nom_arabe = " ".join(x for x in (ism_arabe, laqab_arabe) if x)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Nom en arabe", nom_arabe or "Non renseigné")
-    ligne_pv = df_enseignants[df_enseignants["NOM_NORM"].eq(nom_norm)].iloc[0]
-    c2.metric(
-        "Qualité / Grade",
-        " — ".join(x for x in (
-            nettoyer_texte(ligne_pv.get("Qualité", "")),
-            nettoyer_texte(ligne_pv.get("Grade", ""))
-        ) if x) or "Non renseigné"
-    )
-    c3.metric("Séances EDT", len(seances_enseignant))
-    c4.metric("Volume hebdomadaire EDT", f"{seances_enseignant['DUREE_H'].sum():g} h")
-    if not nom_arabe:
-        st.warning(
-            "Le fichier source ne contient pas encore le nom et le prénom en arabe. "
-            "Renseignez-les ci-dessous pour compléter votre fiche H.SUP."
-        )
-    telephone_compte = nettoyer_texte(metadata_compte.get("telephone", ""))
-    with st.form("hsup_identite_arabe_form"):
-        col_ism, col_laqab = st.columns(2)
-        ism_saisi = col_ism.text_input("الاسم — prénom en arabe (obligatoire)", value=ism_arabe)
-        laqab_saisi = col_laqab.text_input("اللقب — nom en arabe (obligatoire)", value=laqab_arabe)
-        telephone_saisi = st.text_input(
-            "Numéro de téléphone (obligatoire)", value=telephone_compte,
-            placeholder="Ex. : 0550123456 ou +213550123456", max_chars=20
-        )
-        sauvegarder_arabe = st.form_submit_button("Enregistrer mes renseignements personnels")
-    if sauvegarder_arabe:
-        telephone_nettoye = re.sub(r"[\s().-]", "", telephone_saisi.strip())
-        telephone_chiffres = re.sub(r"\D", "", telephone_nettoye)
-        champs_arabes_valides = (
-            bool(re.search(r"[\u0600-\u06FF]", ism_saisi))
-            and bool(re.search(r"[\u0600-\u06FF]", laqab_saisi))
-        )
-        if not champs_arabes_valides:
-            st.error("Le prénom et le nom doivent être renseignés en caractères arabes.")
-        elif len(telephone_chiffres) < 8 or len(telephone_chiffres) > 15:
-            st.error("Le numéro de téléphone est obligatoire et doit contenir entre 8 et 15 chiffres.")
-        else:
-            ok, erreur = enregistrer_identite_enseignant_compte(
-                ism_saisi.strip(), laqab_saisi.strip(), telephone_nettoye
-            )
-            if ok:
-                st.success("Vos renseignements personnels ont été enregistrés dans votre compte.")
-                st.rerun()
-            else:
-                st.error(f"Enregistrement impossible : {erreur}")
-    dict_noms_arabe[normaliser_nom(enseignant_select)] = {
-        "ism": ism_saisi.strip() if 'ism_saisi' in locals() else ism_arabe,
-        "laqab": laqab_saisi.strip() if 'laqab_saisi' in locals() else laqab_arabe,
-        "complet": " ".join(x for x in (
-            ism_saisi.strip() if 'ism_saisi' in locals() else ism_arabe,
-            laqab_saisi.strip() if 'laqab_saisi' in locals() else laqab_arabe
-        ) if x)
-    }
-    if mode_arabe != "exacte" and nom_arabe:
-        libelles_mode = {
-            "ordre": "mêmes mots dans un autre ordre",
-            "orthographe": "orthographe légèrement différente (lettres doublées)",
-            "approchee": "orthographe proche",
-            "partielle": "nom incomplet d'un côté",
-        }
-        st.info(
-            f"Correspondance du formulaire arabe : « {enseignant_select} » ↔ « {cle_arabe} » "
-            f"({libelles_mode.get(mode_arabe, mode_arabe)}). Vérifiez que c'est bien le même enseignant."
-        )
-
-    colonnes_aff = [
-        c for c in ["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]
-        if c in seances_enseignant.columns
-    ]
-    st.markdown("### Séances hebdomadaires issues de l'EDT")
-    st.dataframe(seances_enseignant[colonnes_aff], use_container_width=True, hide_index=True)
-
-    # ---- Emploi du temps individuel en grille (PDF, dimensions du modèle PPER.03) ----
-    st.markdown("### 🗓️ Emploi du temps individuel (grille PDF)")
-    qualite_select = nettoyer_texte(ligne_pv.get("Qualité", "")) or "Enseignant"
-    if trouver_logo() is None:
-        st.info(
-            "logo.PNG introuvable à côté de app.py : le logo intégré de l'université est utilisé. "
-            "Pour utiliser le vôtre, placez logo.PNG à la racine du dépôt GitHub."
-        )
-    st.download_button(
-        label="📥 Télécharger l'emploi du temps individuel (PDF)",
-        data=generer_pdf_edt([(enseignant_select, qualite_select, seances_enseignant)]),
-        file_name=nom_fichier_edt(enseignant_select),
-        mime="application/pdf",
-        use_container_width=True,
-        key="download_edt_individuel",
-    )
-
-    erreurs_horaires = seances_enseignant[
-        seances_enseignant["DUREE_H"].isna()
-    ] if "DUREE_H" in seances_enseignant.columns else pd.DataFrame()
-    if not erreurs_horaires.empty:
-        st.error("Certaines séances ont un horaire non interprétable. Corrige la source EDT.")
-
-    if st.button("🚀 Générer l'état Excel officiel actualisé", type="primary",
-                 use_container_width=True):
-        buffer, total_general, details = generer_excel(
-            enseignant_select, seances_enseignant, dict_noms_arabe,
+    if not est_administrateur:
+        # Compte enseignant : fiche, identité, EDT individuel et état H.SUP.
+        st.divider()
+        afficher_espace_personnel(
+            "ens", enseignant_select, nom_norm, seances_enseignant,
+            df_enseignants, dict_noms_arabe, profil_compte,
             date_debut_cours, date_fin_comptabilisation, exclusions_par_mois,
-            qualite_select
+            etiquette_fichier="Enseignant",
         )
-        nom_fichier_clean = normaliser_nom(enseignant_select).replace(" ", "_")
-        file_name = f"Etat_HSUP_Enseignant_{nom_fichier_clean}_2026_2027.xlsx"
-        st.success(
-            f"État Excel généré. Total calculé sur les dates admissibles : "
-            f"{format_heures_arabe(total_general) or '0سا'}."
-        )
-        st.download_button(
-            label="📥 Télécharger l'état Excel actualisé",
-            data=buffer,
-            file_name=file_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-        st.markdown("#### Vérification du calcul jour par jour")
-        st.dataframe(pd.DataFrame(details), use_container_width=True, hide_index=True)
 
     if est_administrateur:
         st.divider()
@@ -1905,92 +1949,21 @@ try:
             "Accès administrateur confirmé. Vous pouvez préparer les emplois du temps "
             "et les états H.SUP de l'ensemble des enseignants."
         )
-        # ---- Documents personnels de l'administrateur connecté ----
+        # ---- Documents personnels de l'administrateur : mêmes fonctionnalités que l'enseignant ----
         st.subheader("👤 Mes documents personnels — Administrateur")
         st.markdown(
-            "Cette rubrique reprend les fonctionnalités du compte enseignant pour "
-            "l'administrateur connecté : téléchargement de son EDT individuel et génération "
-            "de son état H.SUP officiel. Les calculs utilisent votre identité, votre période "
-            "de comptabilisation et vos jours exclus."
+            "Cette rubrique reprend **toutes** les fonctionnalités du compte enseignant : "
+            "fiche enseignant, nom en arabe et téléphone, séances hebdomadaires, "
+            "emploi du temps individuel (PDF) et état H.SUP officiel (Excel). "
+            "Les calculs utilisent votre identité, votre période de comptabilisation "
+            "et vos jours exclus définis ci-dessus."
         )
-
-        st.markdown("#### 🗓️ Mon emploi du temps individuel")
-        st.caption(
-            f"Enseignant connecté : **{enseignant_select}** — "
-            f"{len(seances_enseignant)} séance(s) trouvée(s) dans l'EDT."
+        afficher_espace_personnel(
+            "adm", enseignant_select, nom_norm, seances_enseignant,
+            df_enseignants, dict_noms_arabe, profil_compte,
+            date_debut_cours, date_fin_comptabilisation, exclusions_par_mois,
+            etiquette_fichier="Administrateur",
         )
-        if seances_enseignant.empty:
-            st.warning(
-                "Aucune séance n'a été trouvée pour votre nom dans le fichier EDT. "
-                "Vérifiez la correspondance de votre identité dans le fichier source."
-            )
-        else:
-            st.dataframe(
-                seances_enseignant[
-                    [c for c in ["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]
-                     if c in seances_enseignant.columns]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.download_button(
-                label="📥 Télécharger mon EDT individuel (PDF)",
-                data=generer_pdf_edt([(enseignant_select, qualite_select, seances_enseignant)]),
-                file_name=nom_fichier_edt(enseignant_select),
-                mime="application/pdf",
-                use_container_width=True,
-                key="admin_download_edt_personnel",
-            )
-
-        st.divider()
-        st.markdown("#### 📊 Mon état individuel des heures supplémentaires")
-        st.caption(
-            f"Période : du {date_debut_cours.strftime('%d/%m/%Y')} "
-            f"au {date_fin_comptabilisation.strftime('%d/%m/%Y')} inclus."
-        )
-        if st.button(
-            "🚀 Générer mon état H.SUP officiel (Excel)",
-            type="primary",
-            use_container_width=True,
-            key="admin_generer_etat_personnel",
-        ):
-            buffer_admin_perso, total_admin_perso, details_admin_perso = generer_excel(
-                enseignant_select,
-                seances_enseignant,
-                dict_noms_arabe,
-                date_debut_cours,
-                date_fin_comptabilisation,
-                exclusions_par_mois,
-                qualite_select,
-            )
-            nom_admin_clean = normaliser_nom(enseignant_select).replace(" ", "_")
-            st.session_state["admin_etat_personnel_pret"] = {
-                "data": buffer_admin_perso.getvalue(),
-                "total": total_admin_perso,
-                "details": details_admin_perso,
-                "nom": f"Etat_HSUP_Administrateur_{nom_admin_clean}_2026_2027.xlsx",
-            }
-
-        etat_admin_pret = st.session_state.get("admin_etat_personnel_pret")
-        if etat_admin_pret:
-            st.success(
-                "Votre état personnel est prêt. Total calculé sur les dates admissibles : "
-                f"{format_heures_arabe(etat_admin_pret['total']) or '0سا'}."
-            )
-            st.download_button(
-                label="📥 Télécharger mon état H.SUP individuel (Excel)",
-                data=etat_admin_pret["data"],
-                file_name=etat_admin_pret["nom"],
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key="admin_download_etat_personnel",
-            )
-            with st.expander("🔎 Vérification du calcul jour par jour"):
-                st.dataframe(
-                    pd.DataFrame(etat_admin_pret["details"]),
-                    use_container_width=True,
-                    hide_index=True,
-                )
 
         st.divider()
         st.subheader("📚 Téléchargement groupé de tous les enseignants")

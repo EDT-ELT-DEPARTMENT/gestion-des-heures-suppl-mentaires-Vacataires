@@ -1529,6 +1529,15 @@ def authentifier_enseignant(liste_enseignants):
                 st.rerun()
             st.stop()
         st.sidebar.success(f"Compte connecté : {email}")
+        if email in admins:
+            st.sidebar.success("🛠️ Espace administration activé")
+            st.sidebar.caption("Les outils administrateur se trouvent dans la section dédiée en bas de la page.")
+        else:
+            st.sidebar.info("Espace enseignant")
+            st.sidebar.caption(
+                "L'accès administration est réservé aux adresses déclarées dans "
+                "HSUP_ADMIN_EMAILS dans .streamlit/secrets.toml."
+            )
         if st.sidebar.button("Déconnexion", key="hsup_logout"):
             st.session_state.pop("hsup_access_token", None)
             st.session_state.pop("hsup_user", None)
@@ -1565,16 +1574,31 @@ def authentifier_enseignant(liste_enseignants):
                 key="hsup_nom_inscription"
             )
             email_inscription = st.text_input("Adresse e-mail professionnelle ou personnelle")
+            telephone_inscription = st.text_input(
+                "Numéro de téléphone — obligatoire",
+                placeholder="Ex. : 0550123456 ou +213550123456",
+                max_chars=20,
+            )
             mdp_inscription = st.text_input("Créer un mot de passe", type="password")
             mdp_confirmation = st.text_input("Confirmer le mot de passe", type="password")
-            ism_inscription = st.text_input("الاسم (prénom en arabe) — facultatif")
-            laqab_inscription = st.text_input("اللقب (nom en arabe) — facultatif")
+            st.markdown("**Renseignements obligatoires en arabe**")
+            ism_inscription = st.text_input("الاسم — prénom en arabe (obligatoire)")
+            laqab_inscription = st.text_input("اللقب — nom en arabe (obligatoire)")
             envoyer_inscription = st.form_submit_button(
                 "Créer mon compte", type="primary", use_container_width=True
             )
         if envoyer_inscription:
-            if not email_inscription.strip() or len(mdp_inscription) < 8:
-                st.error("Indiquez un e-mail valide et un mot de passe d'au moins 8 caractères.")
+            telephone_nettoye = re.sub(r"[\s().-]", "", telephone_inscription.strip())
+            telephone_chiffres = re.sub(r"\D", "", telephone_nettoye)
+            arabe_present = bool(re.search(r"[\u0600-\u06FF]", ism_inscription)) and bool(
+                re.search(r"[\u0600-\u06FF]", laqab_inscription)
+            )
+            if not email_inscription.strip() or "@" not in email_inscription or len(mdp_inscription) < 8:
+                st.error("Indiquez une adresse e-mail valide et un mot de passe d'au moins 8 caractères.")
+            elif not ism_inscription.strip() or not laqab_inscription.strip() or not arabe_present:
+                st.error("Le prénom (الاسم) et le nom (اللقب) doivent être renseignés en caractères arabes.")
+            elif len(telephone_chiffres) < 8 or len(telephone_chiffres) > 15:
+                st.error("Le numéro de téléphone est obligatoire et doit contenir entre 8 et 15 chiffres.")
             elif mdp_inscription != mdp_confirmation:
                 st.error("Les deux mots de passe ne sont pas identiques.")
             else:
@@ -1582,6 +1606,7 @@ def authentifier_enseignant(liste_enseignants):
                     "nom_enseignant": nom_inscription,
                     "ism_arabe": ism_inscription.strip(),
                     "laqab_arabe": laqab_inscription.strip(),
+                    "telephone": telephone_nettoye,
                     "role": "enseignant"
                 }
                 resultat, erreur = _supabase_requete(
@@ -1619,9 +1644,11 @@ def mettre_a_jour_metadonnees_compte(donnees):
     return True, ""
 
 
-def enregistrer_identite_arabe_compte(ism, laqab):
-    """Enregistre les champs arabes dans les métadonnées du compte authentifié."""
-    return mettre_a_jour_metadonnees_compte({"ism_arabe": ism, "laqab_arabe": laqab})
+def enregistrer_identite_enseignant_compte(ism, laqab, telephone):
+    """Enregistre l'identité arabe et le téléphone dans les métadonnées du compte."""
+    return mettre_a_jour_metadonnees_compte({
+        "ism_arabe": ism, "laqab_arabe": laqab, "telephone": telephone
+    })
 
 
 def lire_date_compte(valeur, defaut):
@@ -1768,18 +1795,36 @@ try:
             "Le fichier source ne contient pas encore le nom et le prénom en arabe. "
             "Renseignez-les ci-dessous pour compléter votre fiche H.SUP."
         )
+    telephone_compte = nettoyer_texte(metadata_compte.get("telephone", ""))
     with st.form("hsup_identite_arabe_form"):
         col_ism, col_laqab = st.columns(2)
-        ism_saisi = col_ism.text_input("الاسم — prénom en arabe", value=ism_arabe)
-        laqab_saisi = col_laqab.text_input("اللقب — nom en arabe", value=laqab_arabe)
-        sauvegarder_arabe = st.form_submit_button("Enregistrer mes renseignements en arabe")
+        ism_saisi = col_ism.text_input("الاسم — prénom en arabe (obligatoire)", value=ism_arabe)
+        laqab_saisi = col_laqab.text_input("اللقب — nom en arabe (obligatoire)", value=laqab_arabe)
+        telephone_saisi = st.text_input(
+            "Numéro de téléphone (obligatoire)", value=telephone_compte,
+            placeholder="Ex. : 0550123456 ou +213550123456", max_chars=20
+        )
+        sauvegarder_arabe = st.form_submit_button("Enregistrer mes renseignements personnels")
     if sauvegarder_arabe:
-        ok, erreur = enregistrer_identite_arabe_compte(ism_saisi.strip(), laqab_saisi.strip())
-        if ok:
-            st.success("Vos renseignements en arabe ont été enregistrés dans votre compte.")
-            st.rerun()
+        telephone_nettoye = re.sub(r"[\s().-]", "", telephone_saisi.strip())
+        telephone_chiffres = re.sub(r"\D", "", telephone_nettoye)
+        champs_arabes_valides = (
+            bool(re.search(r"[\u0600-\u06FF]", ism_saisi))
+            and bool(re.search(r"[\u0600-\u06FF]", laqab_saisi))
+        )
+        if not champs_arabes_valides:
+            st.error("Le prénom et le nom doivent être renseignés en caractères arabes.")
+        elif len(telephone_chiffres) < 8 or len(telephone_chiffres) > 15:
+            st.error("Le numéro de téléphone est obligatoire et doit contenir entre 8 et 15 chiffres.")
         else:
-            st.error(f"Enregistrement impossible : {erreur}")
+            ok, erreur = enregistrer_identite_enseignant_compte(
+                ism_saisi.strip(), laqab_saisi.strip(), telephone_nettoye
+            )
+            if ok:
+                st.success("Vos renseignements personnels ont été enregistrés dans votre compte.")
+                st.rerun()
+            else:
+                st.error(f"Enregistrement impossible : {erreur}")
     dict_noms_arabe[normaliser_nom(enseignant_select)] = {
         "ism": ism_saisi.strip() if 'ism_saisi' in locals() else ism_arabe,
         "laqab": laqab_saisi.strip() if 'laqab_saisi' in locals() else laqab_arabe,
@@ -1855,7 +1900,12 @@ try:
 
     if est_administrateur:
         st.divider()
-        st.subheader("📚 Administration — Téléchargement groupé de tous les enseignants")
+        st.header("🛠️ ESPACE ADMINISTRATION")
+        st.success(
+            "Accès administrateur confirmé. Vous pouvez préparer les emplois du temps "
+            "et les états H.SUP de l'ensemble des enseignants."
+        )
+        st.subheader("📚 Téléchargement groupé de tous les enseignants")
         st.markdown(
             "Un seul classeur Excel multifeuille contenant un index cliquable, "
             "un récapitulatif des charges Cours/TD/TP et une fiche officielle par enseignant."
@@ -1938,6 +1988,14 @@ try:
                 use_container_width=True,
                 key="download_hsup_groupe",
             )
+    else:
+        st.divider()
+        st.info(
+            "L'espace administration n'est pas activé pour ce compte. "
+            "Pour donner l'accès administrateur, ajoutez l'adresse e-mail utilisée pour "
+            "vous connecter dans HSUP_ADMIN_EMAILS dans le fichier .streamlit/secrets.toml, "
+            "puis redémarrez Streamlit. Exemple : HSUP_ADMIN_EMAILS = \"admin@exemple.com\"."
+        )
 except Exception as e:
     st.error(f"Une erreur est survenue lors du traitement : {e}")
     st.exception(e)

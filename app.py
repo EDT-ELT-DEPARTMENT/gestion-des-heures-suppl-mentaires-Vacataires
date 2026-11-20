@@ -1667,6 +1667,28 @@ def _edt_lignes_case(seances_case, largeur_utile):
     return lignes
 
 
+EDT_COULEUR_HSUP = (1.0, 0.90, 0.45)              # fond des cases comptées en H.SUP
+EDT_COULEUR_CADRE_HSUP = (0.80, 0.22, 0.0)        # cadre et texte H.SUP
+
+
+def _edt_hsup_case(sc):
+    """(heures H.SUP retenues, durée initiale) pour les séances d'une case de la grille."""
+    h, init = 0.0, 0.0
+    for _, srow in sc:
+        try:
+            v = float(srow.get("_HSUP_H", 0) or 0)
+            if v != v:          # NaN
+                v = 0.0
+            i0 = float(srow.get("_HSUP_INIT", 0) or 0)
+            if i0 != i0:
+                i0 = 0.0
+        except (TypeError, ValueError):
+            v, i0 = 0.0, 0.0
+        h = max(h, v)
+        init = max(init, i0)
+    return h, init
+
+
 def _edt_dessiner_page(c, nom, qualite, seances, logo, page=1, pages=1):
     H = EDT_PAGE_H
 
@@ -1742,6 +1764,7 @@ def _edt_dessiner_page(c, nom, qualite, seances, logo, page=1, pages=1):
         c.drawCentredString((xs[i + 1] + xs[i + 2]) / 2, y(centre_entete) - 0.3 * 7, creneaux[borne])
 
     # lignes de jours
+    cadres_hsup = []
     haut = EDT_TAB_Y0 + EDT_HAUT_ENTETE
     c.setStrokeColorRGB(*EDT_GRIS_BORD)
     for n_jour, jour in enumerate(jours):
@@ -1749,6 +1772,11 @@ def _edt_dessiner_page(c, nom, qualite, seances, logo, page=1, pages=1):
         hauteur = EDT_HAUT_LIGNE
         for i, borne in enumerate(colonnes):
             lignes = _edt_lignes_case(cases.get((jour, borne), []), larg_col - 2 * EDT_MARGE_CASE)
+            h_hsup, h_init = _edt_hsup_case(cases.get((jour, borne), []))
+            if h_hsup > 0:
+                lignes = lignes + [
+                    f"H.SUP : {h_hsup:g} h" + (f" sur {h_init:g} h" if h_hsup < h_init - 1e-6 else "")
+                ]
             contenus[i] = lignes
             hauteur = max(hauteur, len(lignes) * EDT_INTERLIGNE + 12)
         # case « jour »
@@ -1763,15 +1791,56 @@ def _edt_dessiner_page(c, nom, qualite, seances, logo, page=1, pages=1):
             couleur = (1, 1, 1)
             if sc:
                 couleur = EDT_COULEURS_TYPE.get(type_enseignement(sc[0][1].get("Enseignements", "")), (1, 1, 1))
+            est_hsup = _edt_hsup_case(sc)[0] > 0
+            if est_hsup:
+                couleur = EDT_COULEUR_HSUP
             c.setFillColorRGB(*couleur)
             c.rect(xs[i + 1], y(haut + hauteur), xs[i + 2] - xs[i + 1], hauteur, stroke=1, fill=1)
+            if est_hsup:
+                cadres_hsup.append((xs[i + 1], y(haut + hauteur), xs[i + 2] - xs[i + 1], hauteur))
             lignes = contenus[i]
             c.setFillColorRGB(0, 0, 0)
             c.setFont("Helvetica", EDT_TAILLE_CASE)
             for k, ligne in enumerate(lignes):
                 base = centre + (k - (len(lignes) - 1) / 2) * EDT_INTERLIGNE + 0.3 * EDT_TAILLE_CASE
-                c.drawString(xs[i + 1] + EDT_MARGE_CASE, y(base), ligne)
+                if est_hsup and ligne.startswith("H.SUP :"):
+                    c.setFillColorRGB(*EDT_COULEUR_CADRE_HSUP)
+                    c.setFont("Helvetica-Bold", EDT_TAILLE_CASE + 1)
+                    c.drawString(xs[i + 1] + EDT_MARGE_CASE, y(base), ligne)
+                    c.setFillColorRGB(0, 0, 0)
+                    c.setFont("Helvetica", EDT_TAILLE_CASE)
+                else:
+                    c.drawString(xs[i + 1] + EDT_MARGE_CASE, y(base), ligne)
         haut += hauteur
+
+    # cadres épais des cases H.SUP (dessinés après la grille pour n'être pas recouverts)
+    if cadres_hsup:
+        c.setStrokeColorRGB(*EDT_COULEUR_CADRE_HSUP)
+        c.setLineWidth(2.4)
+        for cx, cy, cw, ch in cadres_hsup:
+            c.rect(cx, cy, cw, ch, stroke=1, fill=0)
+        c.setLineWidth(0.57)
+
+    # légende et total H.SUP (seulement si la grille porte le marquage H.SUP)
+    if "_HSUP_H" in seances.columns:
+        total_h = float(pd.to_numeric(seances["_HSUP_H"], errors="coerce").fillna(0).sum())
+        total_eq = float(pd.to_numeric(seances.get("_HSUP_EQ", 0), errors="coerce").fillna(0).sum())
+        ly = haut + 14
+        c.setLineWidth(1.6)
+        c.setStrokeColorRGB(*EDT_COULEUR_CADRE_HSUP)
+        c.setFillColorRGB(*EDT_COULEUR_HSUP)
+        c.rect(EDT_TAB_X0, y(ly + 9), 16, 9, stroke=1, fill=1)
+        texte(EDT_TAB_X0 + 22, ly + 1, "Case encadree = seance comptabilisee en H.SUP", "Helvetica-Bold", 8,
+              EDT_COULEUR_CADRE_HSUP)
+        c.setLineWidth(0.57)
+        c.setStrokeColorRGB(*EDT_GRIS_BORD)
+        c.setFillColorRGB(1, 1, 1)
+        c.rect(EDT_TAB_X0 + 270, y(ly + 9), 16, 9, stroke=1, fill=1)
+        texte(EDT_TAB_X0 + 292, ly + 1, "Autre case = charge reglementaire (7 h equivalent-cours)", "Helvetica", 8,
+              EDT_GRIS_TEXTE)
+        texte(EDT_TAB_X0, ly + 16,
+              f"Total H.SUP retenues : {total_h:.2f} h par semaine ({total_eq:.2f} h equivalent-cours)",
+              "Helvetica-Bold", 9, EDT_COULEUR_CADRE_HSUP)
 
     # pied de page
     texte(793.2, 572.0, f"{page}/{pages}", "Helvetica-Oblique", 7, (0.502, 0.502, 0.502))
@@ -2472,8 +2541,29 @@ def generer_edt_sans_suppressions(indices_a_supprimer, modifications_enseignants
         return sortie
 
 
-def construire_liste_edt_apres_plan(df_edt_modifie, df_enseignants, noms_norm):
-    """[(nom, qualité, séances)] des enseignants indiqués, d'après l'EDT modifié (grille PDF)."""
+def marquer_hsup_seances(seances, selections):
+    """Copie des séances avec _HSUP_H (heures H.SUP retenues), _HSUP_INIT et _HSUP_EQ."""
+    retenues, _, _ = limiter_enseignements_au_depassement(seances, selections, seuil=7.0)
+    heures, initiales, equivalents = {}, {}, {}
+    if not retenues.empty:
+        for idx, row in retenues.iterrows():
+            heures[idx] = round(float(row.get("DUREE_H", 0) or 0), 4)
+            initiales[idx] = round(float(row.get("DUREE_H_INITIALE", row.get("DUREE_H", 0)) or 0), 4)
+            equivalents[idx] = round(float(row.get("HS_EQ_RETENUE", 0) or 0), 4)
+    marque = seances.copy()
+    marque["_HSUP_H"] = [heures.get(i, 0.0) for i in marque.index]
+    marque["_HSUP_INIT"] = [initiales.get(i, 0.0) for i in marque.index]
+    marque["_HSUP_EQ"] = [equivalents.get(i, 0.0) for i in marque.index]
+    return marque
+
+
+def construire_liste_edt_apres_plan(df_edt_modifie, df_enseignants, noms_norm,
+                                    selections_par_nom=None, suffixe_titre=""):
+    """[(nom, qualité, séances)] des enseignants indiqués (grille PDF).
+
+    Si selections_par_nom est fourni, les séances comptées en H.SUP des
+    permanents sont marquées pour être mises en évidence dans la grille.
+    """
     liste = []
     for nn in noms_norm:
         seances = df_edt_modifie[
@@ -2484,7 +2574,9 @@ def construire_liste_edt_apres_plan(df_edt_modifie, df_enseignants, noms_norm):
         ligne = df_enseignants[df_enseignants["NOM_NORM"].eq(nn)]
         nom = nettoyer_texte(ligne.iloc[0].get("NOM", "")) if not ligne.empty else nn
         qualite = (nettoyer_texte(ligne.iloc[0].get("Qualité", "")) if not ligne.empty else "") or "Enseignant"
-        liste.append((nom or nn, qualite, seances))
+        if selections_par_nom is not None and "permanent" in qualite.casefold():
+            seances = marquer_hsup_seances(seances, selections_par_nom.get(nn, []))
+        liste.append(((nom or nn) + suffixe_titre, qualite, seances))
     return liste
 
 
@@ -3508,39 +3600,43 @@ try:
                         use_container_width=True,
                         key="download_edt_mis_a_jour",
                     )
-                    # Nouvel EDT en grille PDF (même forme que la grille individuelle d'origine).
+                    # Nouvel EDT en grille PDF, avec les cases H.SUP mises en évidence.
                     impactes = set(validees.keys())
                     for d in plan_final["details"]:
                         if str(d.get("Décision", "")).startswith("Supprimée aussi"):
                             impactes.add(normaliser_nom(d["Co-enseignant"]))
                     df_edt_modifie_grille = appliquer_plan_edt(df_edt_complet, plan_final)
-                    liste_grille = construire_liste_edt_apres_plan(
-                        df_edt_modifie_grille, df_enseignants, sorted(impactes)
-                    )
-                    if liste_grille:
-                        try:
-                            st.download_button(
-                                label=f"📥 Télécharger le nouvel EDT en grille (PDF, {len(liste_grille)} enseignant(s))",
-                                data=generer_pdf_edt(liste_grille).getvalue(),
-                                file_name=(
-                                    nom_fichier_edt(liste_grille[0][0]).replace(".pdf", "_modifie.pdf")
-                                    if len(liste_grille) == 1 else "EDT_modifies_grille.pdf"
-                                ),
+                    st.markdown("**Grille EDT avec les cases H.SUP encadrées (en orange)**")
+                    try:
+                        liste_avant = construire_liste_edt_apres_plan(
+                            df_edt_complet, df_enseignants, sorted(impactes),
+                            selections_toutes_val, " (AVANT SUPPRESSION)"
+                        )
+                        liste_apres = construire_liste_edt_apres_plan(
+                            df_edt_modifie_grille, df_enseignants, sorted(impactes),
+                            selections_toutes_val, " (APRES SUPPRESSION)"
+                        )
+                        col_av, col_ap = st.columns(2)
+                        if liste_avant:
+                            col_av.download_button(
+                                label="📥 EDT en grille AVANT suppression (H.SUP en évidence)",
+                                data=generer_pdf_edt(liste_avant).getvalue(),
+                                file_name="EDT_grille_AVANT_suppression_HSUP.pdf",
                                 mime="application/pdf",
                                 use_container_width=True,
-                                key="download_edt_grille_modifie",
+                                key="download_edt_grille_avant",
                             )
-                            if len(liste_grille) > 1:
-                                st.download_button(
-                                    label="📥 Un PDF en grille par enseignant (ZIP)",
-                                    data=generer_zip_edt(liste_grille).getvalue(),
-                                    file_name="EDT_modifies_grille.zip",
-                                    mime="application/zip",
-                                    use_container_width=True,
-                                    key="download_edt_grille_modifie_zip",
-                                )
-                        except Exception as exc_grille:
-                            st.error(f"Impossible de générer la grille PDF : {exc_grille}")
+                        if liste_apres:
+                            col_ap.download_button(
+                                label="📥 EDT en grille APRÈS suppression (H.SUP en évidence)",
+                                data=generer_pdf_edt(liste_apres).getvalue(),
+                                file_name="EDT_grille_APRES_suppression_HSUP.pdf",
+                                mime="application/pdf",
+                                use_container_width=True,
+                                key="download_edt_grille_apres",
+                            )
+                    except Exception as exc_grille:
+                        st.error(f"Impossible de générer la grille PDF : {exc_grille}")
                     st.caption(
                         "Pour que les états H.SUP utilisent ce nouvel EDT, remplacez le fichier EDT "
                         "d'origine du dépôt par ce fichier, puis redémarrez l'application."

@@ -602,6 +602,7 @@ def calculer_charge_equivalente_hebdomadaire(seances):
     total_eq = heures["cours"] + heures["td"] / 1.5 + heures["tp"] / 1.5
     return {"cours": round(heures["cours"], 2), "td": round(heures["td"], 2),
             "tp": round(heures["tp"], 2), "total_eq": round(total_eq, 2),
+            "total_eq_brut": total_eq,
             "heures_physiques": round(float(pd.to_numeric(uniques["DUREE_H"], errors="coerce").fillna(0).sum()), 2),
             "seances_uniques": int(len(uniques))}
 
@@ -611,6 +612,12 @@ def calculer_charge_equivalente_hebdomadaire(seances):
 # physiques (durée réelle des séances) au lieu de l'équivalent-cours.
 PLAFOND_HSUP_HEBDO = 12.0
 PLAFOND_HSUP_EN_EQUIVALENT = True
+
+# Reliquat : si les séances cochées ne couvrent pas tout le dépassement (charge
+# totale - 7 h), la différence est prise sur la fin de semaine parmi les séances
+# NON cochées, c'est-à-dire sur la séance qui dépasse réellement les 7 h
+# réglementaires. Aucune case supplémentaire n'est à cocher.
+COMPTER_RELIQUAT_SUR_NON_COCHEES = True
 
 
 def limiter_enseignements_au_depassement(seances_toutes, enseignements_retenus, seuil=7.0,
@@ -622,7 +629,7 @@ def limiter_enseignements_au_depassement(seances_toutes, enseignements_retenus, 
     cette durée équivalente résiduelle est comptabilisée.
     """
     charge = calculer_charge_equivalente_hebdomadaire(seances_toutes)
-    depassement = max(0.0, charge["total_eq"] - float(seuil))
+    depassement = max(0.0, charge.get("total_eq_brut", charge["total_eq"]) - float(seuil))
     if plafond is not None and PLAFOND_HSUP_EN_EQUIVALENT:
         depassement = min(depassement, float(plafond))
     retenus = filtrer_enseignements_hsup(seances_toutes, "permanent", enseignements_retenus)
@@ -666,6 +673,44 @@ def limiter_enseignements_au_depassement(seances_toutes, enseignements_retenus, 
         eq = duree_autorisee / facteur
         restant -= eq
         total_retenu_eq += eq
+    if COMPTER_RELIQUAT_SUR_NON_COCHEES and restant > 1e-9 and lignes:
+        cochees_idx = filtrer_enseignements_hsup(
+            seances_toutes, "permanent", enseignements_retenus
+        ).index
+        cles_deja = {cle_horaire_enseignement(r) for _, r in retenus.iterrows()}
+        autres = seances_toutes[~seances_toutes.index.isin(cochees_idx)].copy()
+        autres = dedoublonner_seances_simultanees(autres)
+        if not autres.empty:
+            autres = autres[[cle_horaire_enseignement(r) not in cles_deja for _, r in autres.iterrows()]]
+        if not autres.empty:
+            # Semaine algérienne : dimanche = premier jour, donc la « fin de semaine » est la dernière séance.
+            ordre_dz = {"dimanche": 0, "lundi": 1, "mardi": 2, "mercredi": 3, "jeudi": 4, "vendredi": 5, "samedi": 6}
+            autres["_JOUR_ORDRE"] = autres.get("JOUR_NORM", autres.get("Jours", "")).apply(
+                lambda x: ordre_dz.get(normaliser_nom(x).lower(), 7)
+            )
+            autres["_DEBUT_ORDRE"] = autres.apply(_debut, axis=1)
+            autres = autres.sort_values(["_JOUR_ORDRE", "_DEBUT_ORDRE"], kind="stable")
+            # On part de la fin de la semaine : c'est la dernière séance qui porte le dépassement.
+            for _, row in autres.iloc[::-1].iterrows():
+                if restant <= 1e-9:
+                    break
+                typ = type_enseignement(row.get("Enseignements", ""))
+                facteur = 1.0 if typ == "cours" else (1.5 if typ in ("td", "tp") else None)
+                if facteur is None:
+                    continue
+                duree = max(0.0, float(row.get("DUREE_H", 0) or 0))
+                duree_autorisee = min(duree, restant * facteur, heures_phys_restantes)
+                if duree_autorisee <= 1e-9:
+                    continue
+                heures_phys_restantes -= duree_autorisee
+                copie = row.copy()
+                copie["DUREE_H"] = round(duree_autorisee, 6)
+                copie["DUREE_H_INITIALE"] = duree
+                copie["HS_EQ_RETENUE"] = round(duree_autorisee / facteur, 6)
+                lignes.append(copie)
+                eq = duree_autorisee / facteur
+                restant -= eq
+                total_retenu_eq += eq
     if not lignes:
         return retenus.iloc[0:0].copy(), charge, 0.0
     resultat = pd.DataFrame(lignes).drop(columns=["_JOUR_ORDRE", "_DEBUT_ORDRE"], errors="ignore")
@@ -2236,6 +2281,181 @@ def charger_historique_generations(limite=500):
     return (resultat or []), erreur
 
 
+def simuler_suppression_hsup(seances_toutes, selections, labels_supprimes):
+    """Compare le calcul H.SUP hebdomadaire avant/après suppression de créneaux.
+
+    Retourne (avant, apres, indices_supprimes) ; chaque résultat est un dict
+    avec la charge, le dépassement brut, les H.SUP retenues (éq-cours et heures
+    physiques) et le détail des séances retenues.
+    """
+    libelles = ajouter_libelles_creneaux_hsup(seances_toutes)["_LIBELLE_HSUP"]
+    cibles = {_norm_creneau_hsup(x) for x in (labels_supprimes or [])}
+    masque = pd.Series([_norm_creneau_hsup(l) in cibles for l in libelles], index=seances_toutes.index)
+    indices_supprimes = list(seances_toutes.index[masque])
+    restantes = seances_toutes[~masque].copy()
+
+    def _calc(seances):
+        retenues, charge, hs_eq = limiter_enseignements_au_depassement(seances, selections, seuil=7.0)
+        brut = max(0.0, charge.get("total_eq_brut", charge["total_eq"]) - 7.0)
+        phys = float(pd.to_numeric(retenues["DUREE_H"], errors="coerce").fillna(0).sum()) if not retenues.empty else 0.0
+        return {"charge": charge, "depassement_brut": brut, "hsup_eq": hs_eq,
+                "hsup_phys": round(phys, 2), "retenues": retenues}
+
+    return _calc(seances_toutes), _calc(restantes), indices_supprimes
+
+
+SEPARATEURS_ENSEIGNANTS_EDT = re.compile(r"(\s*(?:/|,|;|\+|&|\n)\s*)")
+
+
+def _decouper_cellule_enseignants(texte):
+    """Découpe une cellule « Enseignants » en (noms, séparateurs d'origine)."""
+    jetons = SEPARATEURS_ENSEIGNANTS_EDT.split(nettoyer_texte(texte))
+    return [x.strip() for x in jetons[0::2]], jetons[1::2]
+
+
+def _reconstruire_cellule_enseignants(noms, separateurs, garder):
+    sortie, premier = "", True
+    for j, nom in enumerate(noms):
+        if not garder[j] or not nom:
+            continue
+        if not premier:
+            sortie += separateurs[j - 1] if 0 <= j - 1 < len(separateurs) else " / "
+        sortie += nom
+        premier = False
+    return sortie
+
+
+def enseignant_depasse_plafond_hsup(df_complet, df_enseignants, nom_norm, selections):
+    """(depasse, valeur) : l'enseignant dépasse-t-il le plafond hebdomadaire H.SUP ?
+
+    Seuls les permanents sont concernés. La valeur est le dépassement sur 7 h
+    avant plafond (éq-cours), ou les H.SUP physiques si le plafond est en heures physiques.
+    """
+    ligne = df_enseignants[df_enseignants["NOM_NORM"].eq(nom_norm)]
+    if ligne.empty or "permanent" not in nettoyer_texte(ligne.iloc[0].get("Qualité", "")).casefold():
+        return False, 0.0
+    seances = df_complet[df_complet["Enseignants"].apply(lambda x: correspond_enseignant(x, nom_norm))]
+    if seances.empty:
+        return False, 0.0
+    if PLAFOND_HSUP_EN_EQUIVALENT:
+        charge = calculer_charge_equivalente_hebdomadaire(seances)
+        valeur = max(0.0, charge.get("total_eq_brut", charge["total_eq"]) - 7.0)
+    else:
+        retenues, _, _ = limiter_enseignements_au_depassement(seances, selections, seuil=7.0, plafond=None)
+        valeur = float(pd.to_numeric(retenues["DUREE_H"], errors="coerce").fillna(0).sum()) if not retenues.empty else 0.0
+    return valeur > PLAFOND_HSUP_HEBDO + 1e-9, valeur
+
+
+def construire_plan_edt(df_complet, df_enseignants, demandes, selections_par_nom):
+    """Plan de modification de l'EDT pour des suppressions demandées.
+
+    demandes : {nom_norm: [libellés de créneaux à supprimer]}.
+    Pour une séance partagée, les co-enseignants la perdent seulement s'ils
+    dépassent eux aussi le plafond ; sinon elle est conservée pour eux (seul le
+    nom de l'enseignant concerné est retiré de la cellule « Enseignants »).
+    Retourne {"supprimer": set(index), "modifier": {index: texte}, "details": [...], "avertissements": [...]}.
+    """
+    a_retirer, details, avertissements, cache = {}, [], [], {}
+
+    def _depasse(nn):
+        if nn not in cache:
+            cache[nn] = enseignant_depasse_plafond_hsup(
+                df_complet, df_enseignants, nn, selections_par_nom.get(nn, [])
+            )
+        return cache[nn]
+
+    for nn, labels in (demandes or {}).items():
+        seances = df_complet[df_complet["Enseignants"].apply(lambda x, n=nn: correspond_enseignant(x, n))]
+        if seances.empty or not labels:
+            continue
+        libelles = ajouter_libelles_creneaux_hsup(seances)["_LIBELLE_HSUP"]
+        cibles = {_norm_creneau_hsup(x) for x in labels}
+        for i, lib in zip(seances.index, libelles):
+            if _norm_creneau_hsup(lib) not in cibles:
+                continue
+            noms, _ = _decouper_cellule_enseignants(df_complet.at[i, "Enseignants"])
+            retires = a_retirer.setdefault(i, set())
+            retires.add(nn)
+            autres = [x for x in noms if x and not correspond_enseignant(x, nn)]
+            if not autres:
+                details.append({"Séance": lib, "Enseignant": nn, "Co-enseignant": "—",
+                                "Dépassement co-enseignant": "—", "Décision": "Séance supprimée"})
+            for autre in autres:
+                autre_norm = normaliser_nom(autre)
+                depasse, valeur = _depasse(autre_norm)
+                if depasse:
+                    retires.add(autre_norm)
+                details.append({
+                    "Séance": lib, "Enseignant": nn, "Co-enseignant": autre,
+                    "Dépassement co-enseignant": f"{valeur:.2f} h",
+                    "Décision": "Supprimée aussi (dépasse le plafond)" if depasse
+                                else "Conservée pour lui (sous le plafond)",
+                })
+
+    supprimer, modifier = set(), {}
+    for i, retires in a_retirer.items():
+        cellule = df_complet.at[i, "Enseignants"]
+        noms, seps = _decouper_cellule_enseignants(cellule)
+        garder = [
+            bool(n) and not any(
+                normaliser_nom(n) == r or correspond_enseignant(n, r) for r in retires
+            )
+            for n in noms
+        ]
+        if not any(garder):
+            supprimer.add(i)
+        elif all(garder):
+            avertissements.append(f"Ligne {i + 2} : cellule « {cellule} » non modifiable automatiquement.")
+        else:
+            modifier[i] = _reconstruire_cellule_enseignants(noms, seps, garder)
+    return {"supprimer": supprimer, "modifier": modifier,
+            "details": details, "avertissements": avertissements}
+
+
+def generer_edt_sans_suppressions(indices_a_supprimer, modifications_enseignants=None):
+    """Reconstruit le fichier EDT d'origine sans les lignes indiquées (index pandas).
+
+    modifications_enseignants : {index: nouveau texte de la cellule « Enseignants »}
+    pour les séances partagées conservées pour les co-enseignants.
+    """
+    indices = sorted({int(i) for i in indices_a_supprimer}, reverse=True)
+    modifs = {int(k): v for k, v in (modifications_enseignants or {}).items()}
+    df_ref = pd.read_excel(FICHIER_EDT, sheet_name=0, dtype=str)
+    df_ref.columns = [nettoyer_texte(c) for c in df_ref.columns]
+    # 1) Méthode préférée : modifier le classeur d'origine (mise en forme conservée).
+    try:
+        wb = openpyxl.load_workbook(FICHIER_EDT)
+        ws = wb.worksheets[0]
+        entetes = {nettoyer_texte(c.value): c.column for c in ws[1] if c.value is not None}
+        col_ens, col_prof = entetes.get("Enseignements"), entetes.get("Enseignants")
+        if not col_ens or not col_prof:
+            raise ValueError("colonnes introuvables")
+        for i in set(indices) | set(modifs):
+            valeur_xl = nettoyer_texte(ws.cell(row=i + 2, column=col_ens).value)
+            valeur_df = nettoyer_texte(df_ref.iloc[i].get("Enseignements", ""))
+            if valeur_xl != valeur_df:
+                raise ValueError("décalage de lignes")
+        for i, texte in modifs.items():
+            ws.cell(row=i + 2, column=col_prof).value = texte
+        for i in indices:
+            ws.delete_rows(i + 2)
+        sortie = io.BytesIO()
+        wb.save(sortie)
+        sortie.seek(0)
+        return sortie
+    except Exception:
+        # 2) Repli : réécriture simple de la première feuille.
+        for i, texte in modifs.items():
+            if i < len(df_ref):
+                df_ref.at[df_ref.index[i], "Enseignants"] = texte
+        sortie = io.BytesIO()
+        df_ref.drop(index=[df_ref.index[i] for i in indices if i < len(df_ref)]).to_excel(
+            sortie, index=False, sheet_name="EDT"
+        )
+        sortie.seek(0)
+        return sortie
+
+
 def effacer_historique_generations():
     """Supprime toutes les lignes de l'historique des générations (admin, service_role)."""
     _, erreur = _supabase_table_requete(
@@ -3136,6 +3356,127 @@ try:
                         st.error(
                             "Enregistrement impossible : " + erreur_reglage
                         )
+
+        # ---- Simulation : supprimer des enseignements pour respecter le plafond hebdomadaire ----
+        st.divider()
+        st.markdown("#### 🧪 Simulation de suppression d'enseignements (plafond H.SUP hebdomadaire)")
+        st.caption(
+            f"Choisissez un enseignant permanent, cochez les enseignements (par créneau) à supprimer, "
+            f"puis lisez la simulation : le total H.SUP est plafonné à {PLAFOND_HSUP_HEBDO:g} h par semaine. "
+            "Rien n'est modifié tant que vous n'avez pas validé ; le nouvel EDT se télécharge ensuite en Excel."
+        )
+        permanents_sim = []
+        for nom_sim in selection_hsup_excel:
+            lig_sim = df_enseignants[df_enseignants["NOM_NORM"].eq(normaliser_nom(nom_sim))]
+            if not lig_sim.empty and "permanent" in nettoyer_texte(lig_sim.iloc[0].get("Qualité", "")).casefold():
+                permanents_sim.append(nom_sim)
+
+        if "edt_suppressions_validees" not in st.session_state:
+            st.session_state["edt_suppressions_validees"] = {}
+
+        if not permanents_sim:
+            st.info("Sélectionnez d'abord au moins un enseignant permanent dans « Enseignants à inclure dans les états H.SUP Excel ».")
+        else:
+            nom_sim = st.selectbox("Enseignant permanent à simuler", permanents_sim, key="sim_supp_enseignant")
+            nom_norm_sim = normaliser_nom(nom_sim)
+            seances_sim = df_edt_complet[
+                df_edt_complet["Enseignants"].apply(lambda x: correspond_enseignant(x, nom_norm_sim))
+            ].copy()
+            try:
+                prefs_sim, _, _ = charger_preferences_hsup_admin()
+            except Exception:
+                prefs_sim = {}
+            selections_sim = prefs_sim.get(nom_norm_sim, []) or reglages_admin_selections.get(nom_norm_sim, [])
+
+            if seances_sim.empty:
+                st.info("Aucune séance trouvée pour cet enseignant.")
+            else:
+                options_sim = options_enseignements_hsup(seances_sim)
+                deja_valides = st.session_state["edt_suppressions_validees"].get(nom_norm_sim, [])
+                a_supprimer = st.multiselect(
+                    "Enseignements à supprimer (par créneau)",
+                    options=options_sim,
+                    default=[x for x in deja_valides if x in options_sim],
+                    key=f"sim_supp_choix_{nom_norm_sim}",
+                )
+                avant, apres, indices_sim = simuler_suppression_hsup(seances_sim, selections_sim, a_supprimer)
+
+                def _fmt(v):
+                    return f"{v:.2f} h"
+                plafond_txt = f"{PLAFOND_HSUP_HEBDO:g} h"
+                tableau_sim = pd.DataFrame([
+                    {"Indicateur": "Charge totale (éq-cours)", "Avant": _fmt(avant["charge"]["total_eq"]), "Après": _fmt(apres["charge"]["total_eq"])},
+                    {"Indicateur": "Dépassement sur 7 h (avant plafond)", "Avant": _fmt(avant["depassement_brut"]), "Après": _fmt(apres["depassement_brut"])},
+                    {"Indicateur": "H.SUP retenues / semaine (éq-cours)", "Avant": _fmt(avant["hsup_eq"]), "Après": _fmt(apres["hsup_eq"])},
+                    {"Indicateur": "H.SUP physiques / semaine", "Avant": _fmt(avant["hsup_phys"]), "Après": _fmt(apres["hsup_phys"])},
+                    {"Indicateur": f"Plafond {plafond_txt} respecté sans troncature ?",
+                     "Avant": "Oui" if avant["depassement_brut"] <= PLAFOND_HSUP_HEBDO + 1e-9 else "Non",
+                     "Après": "Oui" if apres["depassement_brut"] <= PLAFOND_HSUP_HEBDO + 1e-9 else "Non"},
+                    {"Indicateur": "Séances supprimées", "Avant": "0", "Après": str(len(indices_sim))},
+                ])
+                st.dataframe(tableau_sim, use_container_width=True, hide_index=True)
+
+                if indices_sim:
+                    selections_toutes = dict(reglages_admin_selections)
+                    selections_toutes.update({k: v for k, v in prefs_sim.items() if v})
+                    plan_apercu = construire_plan_edt(
+                        df_edt_complet, df_enseignants, {nom_norm_sim: a_supprimer}, selections_toutes
+                    )
+                    partages_apercu = [d for d in plan_apercu["details"] if d["Co-enseignant"] != "—"]
+                    if partages_apercu:
+                        st.markdown(
+                            "**Séances partagées** : un co-enseignant ne perd la séance que s'il dépasse lui aussi "
+                            f"le plafond de {PLAFOND_HSUP_HEBDO:g} h."
+                        )
+                        st.dataframe(pd.DataFrame(partages_apercu), use_container_width=True, hide_index=True)
+                    for avert in plan_apercu["avertissements"]:
+                        st.warning(avert)
+
+                col_val, col_ann = st.columns(2)
+                if col_val.button("✅ Valider cette suppression", key=f"sim_supp_valider_{nom_norm_sim}",
+                                  use_container_width=True, disabled=not a_supprimer):
+                    st.session_state["edt_suppressions_validees"][nom_norm_sim] = list(a_supprimer)
+                    st.success(f"Suppression validée pour {nom_sim}.")
+                if col_ann.button("↩️ Annuler les suppressions validées de cet enseignant",
+                                  key=f"sim_supp_annuler_{nom_norm_sim}", use_container_width=True):
+                    st.session_state["edt_suppressions_validees"].pop(nom_norm_sim, None)
+                    st.rerun()
+
+            validees = st.session_state["edt_suppressions_validees"]
+            if validees:
+                st.markdown("**Suppressions validées (à appliquer au nouvel EDT)**")
+                selections_toutes_val = dict(reglages_admin_selections)
+                selections_toutes_val.update({k: v for k, v in prefs_sim.items() if v})
+                plan_final = construire_plan_edt(
+                    df_edt_complet, df_enseignants, validees, selections_toutes_val
+                )
+                lignes_val = [
+                    {"Enseignant": nn, "Enseignement supprimé": lab}
+                    for nn, labels in validees.items() for lab in labels
+                ]
+                st.dataframe(pd.DataFrame(lignes_val), use_container_width=True, hide_index=True)
+                if plan_final["details"]:
+                    with st.expander("Détail des séances partagées", expanded=False):
+                        st.dataframe(pd.DataFrame(plan_final["details"]), use_container_width=True, hide_index=True)
+                for avert in plan_final["avertissements"]:
+                    st.warning(avert)
+                nb_modifs = len(plan_final["supprimer"]) + len(plan_final["modifier"])
+                if nb_modifs:
+                    st.download_button(
+                        label=(
+                            f"📥 Télécharger le nouvel EDT ({len(plan_final['supprimer'])} ligne(s) supprimée(s), "
+                            f"{len(plan_final['modifier'])} séance(s) partagée(s) conservée(s))"
+                        ),
+                        data=generer_edt_sans_suppressions(plan_final["supprimer"], plan_final["modifier"]),
+                        file_name="EDT_mis_a_jour_sans_enseignements_supprimes.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="download_edt_mis_a_jour",
+                    )
+                    st.caption(
+                        "Pour que les états H.SUP utilisent ce nouvel EDT, remplacez le fichier EDT "
+                        "d'origine du dépôt par ce fichier, puis redémarrez l'application."
+                    )
 
         if st.button(
             "🗓️ Préparer les états H.SUP Excel",

@@ -12,7 +12,6 @@ import base64
 import json
 import urllib.request
 import urllib.error
-import urllib.parse
 import calendar
 import copy
 import unicodedata
@@ -66,10 +65,7 @@ FICHIER_COORD = choisir_fichier(
     "Vos coordonnées en Arabe (réponses)(1).xlsx",
     ("Vos coordonnées en Arabe (réponses).xlsx",),
 )
-FICHIER_TEMPLATE = choisir_fichier(
-    "Etat_HSUP_Enseignant_2026_2027.xlsx",
-    ("Etat_HSUP_Vacataire_ABBAS_MOHAMED_2026_2027.xlsx",),
-)
+FICHIER_TEMPLATE = BASE_DIR / "Etat_HSUP_Enseignant_2026_2027.xlsx"
 
 # Les blocs et lignes correspondent à la feuille « Nom & prénom » du modèle fourni.
 # Mois affichés dans la fiche : le tableau est reconstruit dynamiquement (une ligne par jour travaillé).
@@ -425,123 +421,6 @@ def etiquettes_dates(annee, mois):
     return labels
 
 
-def cle_horaire_enseignement(ligne):
-    """Clé d'une séance simultanée : jour + horaire + type (promotion ignorée)."""
-    horaire = nettoyer_texte(ligne.get("Horaire", ""))
-    jour = nettoyer_texte(ligne.get("JOUR_NORM", ligne.get("Jours", ""))).casefold()
-    nature = type_enseignement(ligne.get("Enseignements", ""))
-    return jour, re.sub(r"\s+", "", horaire).casefold(), nature
-
-
-def dedoublonner_seances_simultanees(seances):
-    """Une seule séance par jour/horaire/type pour un même enseignant.
-
-    Les promotions et les intitulés peuvent différer : si le même enseignant
-    assure au même moment plusieurs Cours, TD ou TP pour plusieurs promotions,
-    le créneau est compté une seule fois. Les types différents restent distincts.
-    """
-    if seances.empty:
-        return seances.copy()
-    travail = seances.copy()
-    if "JOUR_NORM" not in travail.columns:
-        travail["JOUR_NORM"] = travail.get("Jours", "").apply(normaliser_nom).str.lower()
-    travail["_TYPE_HSUP"] = travail["Enseignements"].apply(type_enseignement)
-    travail["_HORAIRE_HSUP"] = travail["Horaire"].apply(
-        lambda x: re.sub(r"\s+", "", nettoyer_texte(x)).casefold()
-    )
-    # Les lignes sans type ou horaire interprétable ne sont pas fusionnées.
-    travail["_CLE_SIMULTANEE"] = travail.apply(
-        lambda r: (r.get("JOUR_NORM", ""), r.get("_HORAIRE_HSUP", ""), r.get("_TYPE_HSUP", ""))
-        if r.get("_HORAIRE_HSUP") and r.get("_TYPE_HSUP") else ("LIGNE", int(r.name)), axis=1
-    )
-    travail = travail.drop_duplicates(subset=["_CLE_SIMULTANEE"], keep="first")
-    return travail.drop(columns=["_TYPE_HSUP", "_HORAIRE_HSUP", "_CLE_SIMULTANEE"], errors="ignore")
-
-
-def filtrer_enseignements_hsup(seances, qualite_enseignant, enseignements_retenus=None):
-    """Pour les permanents, ne conserve que les enseignements désignés comme H.SUP."""
-    est_permanent = "permanent" in nettoyer_texte(qualite_enseignant).casefold()
-    if not est_permanent:
-        return seances.copy()
-    retenus = {nettoyer_texte(x) for x in (enseignements_retenus or []) if nettoyer_texte(x)}
-    if not retenus:
-        return seances.iloc[0:0].copy()
-    return seances[seances["Enseignements"].apply(nettoyer_texte).isin(retenus)].copy()
-
-
-def calculer_charge_equivalente_hebdomadaire(seances):
-    """Calcule la charge hebdomadaire en équivalent-cours après déduplication.
-
-    1 h Cours = 1 h équivalent-cours ; 1,5 h TD ou TP = 1 h équivalent-cours.
-    Les promotions différentes au même jour/créneau/type ne sont comptées qu'une fois.
-    """
-    uniques = dedoublonner_seances_simultanees(seances)
-    if uniques.empty:
-        return {"cours": 0.0, "td": 0.0, "tp": 0.0, "total_eq": 0.0,
-                "heures_physiques": 0.0, "seances_uniques": 0}
-    types = uniques["Enseignements"].apply(type_enseignement)
-    heures = {}
-    for t in ("cours", "td", "tp"):
-        heures[t] = float(pd.to_numeric(uniques.loc[types.eq(t), "DUREE_H"], errors="coerce").fillna(0).sum())
-    total_eq = heures["cours"] + heures["td"] / 1.5 + heures["tp"] / 1.5
-    return {"cours": round(heures["cours"], 2), "td": round(heures["td"], 2),
-            "tp": round(heures["tp"], 2), "total_eq": round(total_eq, 2),
-            "heures_physiques": round(float(pd.to_numeric(uniques["DUREE_H"], errors="coerce").fillna(0).sum()), 2),
-            "seances_uniques": int(len(uniques))}
-
-
-def limiter_enseignements_au_depassement(seances_toutes, enseignements_retenus, seuil=7.0):
-    """Retient les séances choisies dans la limite du dépassement hebdomadaire.
-
-    L'allocation suit l'ordre chronologique des séances dans la semaine. Si le
-    dépassement restant ne couvre qu'une partie de la dernière séance, seule
-    cette durée équivalente résiduelle est comptabilisée.
-    """
-    charge = calculer_charge_equivalente_hebdomadaire(seances_toutes)
-    depassement = max(0.0, charge["total_eq"] - float(seuil))
-    retenus = filtrer_enseignements_hsup(seances_toutes, "permanent", enseignements_retenus)
-    retenus = dedoublonner_seances_simultanees(retenus)
-    if retenus.empty or depassement <= 0:
-        return retenus.iloc[0:0].copy(), charge, 0.0
-
-    travail = retenus.copy()
-    travail["_JOUR_ORDRE"] = travail.get("JOUR_NORM", travail.get("Jours", "")).apply(
-        lambda x: JOURS_FR.get(normaliser_nom(x).lower(), 7)
-    )
-    def _debut(row):
-        try:
-            return lire_heure(re.split(r"\s*-\s*", nettoyer_texte(row.get("Horaire", "")).replace("–", "-").replace("—", "-"))[0])
-        except Exception:
-            return 9999
-    travail["_DEBUT_ORDRE"] = travail.apply(_debut, axis=1)
-    travail = travail.sort_values(["_JOUR_ORDRE", "_DEBUT_ORDRE"], kind="stable")
-
-    restant = depassement
-    lignes = []
-    total_retenu_eq = 0.0
-    for _, row in travail.iterrows():
-        typ = type_enseignement(row.get("Enseignements", ""))
-        facteur = 1.0 if typ == "cours" else (1.5 if typ in ("td", "tp") else None)
-        if facteur is None or restant <= 1e-9:
-            continue
-        duree = max(0.0, float(row.get("DUREE_H", 0) or 0))
-        duree_autorisee = min(duree, restant * facteur)
-        if duree_autorisee <= 1e-9:
-            continue
-        copie = row.copy()
-        copie["DUREE_H"] = round(duree_autorisee, 6)
-        copie["DUREE_H_INITIALE"] = duree
-        copie["HS_EQ_RETENUE"] = round(duree_autorisee / facteur, 6)
-        lignes.append(copie)
-        eq = duree_autorisee / facteur
-        restant -= eq
-        total_retenu_eq += eq
-    if not lignes:
-        return retenus.iloc[0:0].copy(), charge, 0.0
-    resultat = pd.DataFrame(lignes).drop(columns=["_JOUR_ORDRE", "_DEBUT_ORDRE"], errors="ignore")
-    return resultat, charge, round(total_retenu_eq, 2)
-
-
 def calculer_heures_par_jour(seances, annee, mois, date_debut, date_fin, exclusions):
     """
     Charge horaire de l'enseignant JOUR PAR JOUR pour un mois donné.
@@ -561,9 +440,6 @@ def calculer_heures_par_jour(seances, annee, mois, date_debut, date_fin, exclusi
         lignes = seances[seances["JOUR_NORM"].eq(NOMS_JOURS_FR[d.weekday()])]
         if lignes.empty:
             continue
-        # Plusieurs promotions au même jour/créneau/type pour le même enseignant
-        # représentent une seule séance (Cours avec Cours, TD avec TD, TP avec TP).
-        lignes = dedoublonner_seances_simultanees(lignes)
         resultats.append({
             "date": d,
             "jour_fr": NOMS_JOURS_FR[d.weekday()].capitalize(),
@@ -820,8 +696,7 @@ def nom_onglet_unique(nom, deja_utilises):
 
 
 def generer_excel_groupe(df_enseignants, df_edt, liste_enseignants, dict_arabe,
-                         date_debut, date_fin, exclusions_par_mois,
-                         selections_hsup_par_enseignant=None):
+                         date_debut, date_fin, exclusions_par_mois):
     """
     Crée un seul classeur : index cliquable, récapitulatif, puis une fiche
     officielle par enseignant (une feuille par enseignant).
@@ -845,10 +720,9 @@ def generer_excel_groupe(df_enseignants, df_edt, liste_enseignants, dict_arabe,
     recap_headers = [
         "Enseignant", "Nom et prénom en arabe",
         "Nombre Cours", "Nombre TD", "Nombre TP",
-        "Heures Cours retenues H.SUP / semaine", "Heures TD retenues H.SUP / semaine",
-        "Heures TP retenues H.SUP / semaine", "Heures H.SUP physiques / semaine",
-        "Charge totale équivalent-cours / semaine", "Dépassement au-dessus de 7 h éq-cours",
-        "H.SUP retenues équivalent-cours / semaine", "Total H.SUP période",
+        "Heures Cours / semaine", "Heures TD / semaine",
+        "Heures TP / semaine", "Total heures EDT / semaine",
+        "Total H.SUP période",
     ]
     mois_cols = [bloc["nom"] for bloc in MOIS_BLOCKS]
     ws_recap.append(recap_headers + mois_cols)
@@ -907,14 +781,6 @@ def generer_excel_groupe(df_enseignants, df_edt, liste_enseignants, dict_arabe,
             nettoyer_texte(ligne_personnel.iloc[0].get("Qualité", ""))
             if not ligne_personnel.empty else ""
         )
-        charge_complete = calculer_charge_equivalente_hebdomadaire(seances)
-        hsup_eq_retenue = None
-        if "permanent" in qualite_fiche.casefold():
-            choix_hsup = (selections_hsup_par_enseignant or {}).get(normaliser_nom(nom), [])
-            seances, _, hsup_eq_retenue = limiter_enseignements_au_depassement(
-                seances, choix_hsup, seuil=7.0
-            )
-        # Les vacataires gardent le calcul de leurs séances réelles.
         total, details, heures_mois = remplir_fiche(
             ws_fiche, nom, seances, dict_arabe, date_debut, date_fin,
             exclusions_par_mois, qualite_fiche
@@ -951,9 +817,6 @@ def generer_excel_groupe(df_enseignants, df_edt, liste_enseignants, dict_arabe,
             round(heures_type["cours"], 2), round(heures_type["td"], 2),
             round(heures_type["tp"], 2),
             round(float(seances["DUREE_H"].sum()), 2),
-            round(charge_complete["total_eq"], 2),
-            round(max(0.0, charge_complete["total_eq"] - 7.0), 2) if "permanent" in qualite_fiche.casefold() else 0.0,
-            round(float(hsup_eq_retenue or 0.0), 2) if "permanent" in qualite_fiche.casefold() else 0.0,
             round(total, 2),
         ]
         ligne_recap.extend(round(heures_mois.get(cle, 0.0), 2)
@@ -1611,10 +1474,9 @@ def _supabase_config():
             or st.secrets.get("SUPABASE_KEY", "")
         ).strip()
         admins = str(st.secrets.get("HSUP_ADMIN_EMAILS", "")).strip()
-        service_role = str(st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")).strip()
     except Exception:
-        url, key, admins, service_role = "", "", "", ""
-    return url, key, {x.strip().casefold() for x in admins.split(",") if x.strip()}, service_role
+        url, key, admins = "", "", ""
+    return url, key, {x.strip().casefold() for x in admins.split(",") if x.strip()}
 
 
 def _supabase_requete(url, anon_key, chemin, donnees, access_token=None):
@@ -1641,98 +1503,9 @@ def _supabase_requete(url, anon_key, chemin, donnees, access_token=None):
         return None, str(exc)
 
 
-def _supabase_table_requete(table, methode="GET", donnees=None, params="", admin=False):
-    """Accès PostgREST à la table hsup_preferences.
-
-    Les enseignants utilisent leur JWT (RLS limité à auth.uid()). Les opérations
-    globales d'administration utilisent uniquement la clé service_role côté serveur.
-    """
-    url, anon_key, _, service_role = _supabase_config()
-    token = service_role if admin else st.session_state.get("hsup_access_token", "")
-    cle = service_role if admin and service_role else anon_key
-    if not url or not cle or not token:
-        return None, "Configuration Supabase incomplète (clé API, session ou service role)."
-    url_requete = f"{url}/rest/v1/{table}"
-    if params:
-        url_requete += "?" + params
-    headers = {"apikey": cle, "Authorization": f"Bearer {token}",
-               "Content-Type": "application/json", "Accept": "application/json"}
-    if methode == "POST":
-        headers["Prefer"] = "resolution=merge-duplicates,return=representation"
-    corps = None if donnees is None else json.dumps(donnees, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url_requete, data=corps, headers=headers, method=methode)
-    try:
-        with urllib.request.urlopen(req, timeout=25) as response:
-            contenu = response.read().decode("utf-8")
-            return (json.loads(contenu) if contenu else []), None
-    except urllib.error.HTTPError as exc:
-        try:
-            detail = json.loads(exc.read().decode("utf-8"))
-            message = detail.get("message") or detail.get("hint") or str(detail)
-        except Exception:
-            message = str(exc)
-        return None, message
-    except Exception as exc:
-        return None, str(exc)
-
-
-def sauvegarder_preferences_hsup(user_id, nom_enseignant, selections=None, exclu=None):
-    """Crée ou met à jour la préférence H.SUP du compte enseignant."""
-    if not user_id:
-        return False, "Identifiant utilisateur Supabase absent."
-    ligne = {"user_id": user_id, "teacher_name": nom_enseignant,
-             "selected_teachings": list(selections or [])}
-    if exclu is not None:
-        ligne["excluded"] = bool(exclu)
-    resultat, erreur = _supabase_table_requete(
-        "hsup_preferences", "POST", ligne, "on_conflict=user_id", admin=False
-    )
-    return (erreur is None), (erreur or "")
-
-
-def charger_preferences_hsup_admin():
-    """Charge les choix personnels et les exclusions globales avec la clé serveur."""
-    resultat, erreur = _supabase_table_requete(
-        "hsup_preferences", "GET", params="select=user_id,teacher_name,selected_teachings,excluded&order=teacher_name.asc",
-        admin=True
-    )
-    if erreur:
-        return {}, set(), erreur
-    selections, exclus = {}, set()
-    for ligne in resultat or []:
-        nom = normaliser_nom(ligne.get("teacher_name", ""))
-        if nom:
-            selections[nom] = ligne.get("selected_teachings") or []
-            if ligne.get("excluded"):
-                exclus.add(nom)
-    # Les exclusions sont stockées indépendamment des comptes enseignants :
-    # l'administration peut donc exclure aussi un enseignant non encore inscrit.
-    reglages, erreur_reglages = _supabase_table_requete(
-        "hsup_admin_settings", "GET", params="select=excluded_teachers&id=eq.1", admin=True
-    )
-    if erreur_reglages:
-        return {}, set(), erreur_reglages
-    if reglages:
-        exclus = {normaliser_nom(x) for x in (reglages[0].get("excluded_teachers") or [])}
-    return selections, exclus, ""
-
-
-def mettre_a_jour_exclusions_admin(noms_exclus, df_enseignants=None):
-    """Enregistre la liste globale des enseignants exclus, indépendamment des comptes."""
-    url, anon_key, _, service_role = _supabase_config()
-    if not service_role:
-        return False, "Ajoutez SUPABASE_SERVICE_ROLE_KEY aux Secrets Streamlit pour administrer les exclusions globales."
-    liste = sorted({nettoyer_texte(n) for n in noms_exclus if nettoyer_texte(n)})
-    payload = {"id": 1, "excluded_teachers": liste}
-    _, erreur = _supabase_table_requete(
-        "hsup_admin_settings", "POST", payload, "on_conflict=id", admin=True
-    )
-    return (erreur is None), (erreur or "")
-
-
 def authentifier_enseignant(liste_enseignants):
     """Inscription/connexion. L'identité française est liée au référentiel EDT."""
-    url, anon_key, admins, service_role = _supabase_config()
+    url, anon_key, admins = _supabase_config()
     if not url or not anon_key:
         st.error(
             "L'inscription sécurisée n'est pas encore activée. "
@@ -1857,7 +1630,7 @@ def authentifier_enseignant(liste_enseignants):
 
 def mettre_a_jour_metadonnees_compte(donnees):
     """Enregistre les préférences personnelles dans les métadonnées du compte Supabase."""
-    url, anon_key, _, _service_role = _supabase_config()
+    url, anon_key, _ = _supabase_config()
     token = st.session_state.get("hsup_access_token")
     if not token:
         return False, "Aucun compte connecté."
@@ -2017,16 +1790,6 @@ try:
     )
     c3.metric("Séances EDT", len(seances_enseignant))
     c4.metric("Volume hebdomadaire EDT", f"{seances_enseignant['DUREE_H'].sum():g} h")
-    charge_connecte = calculer_charge_equivalente_hebdomadaire(seances_enseignant)
-    depassement_connecte = max(0.0, charge_connecte["total_eq"] - 7.0) if "permanent" in nettoyer_texte(ligne_pv.get("Qualité", "")).casefold() else 0.0
-    if "permanent" in nettoyer_texte(ligne_pv.get("Qualité", "")).casefold():
-        st.info(
-            f"**Charge réglementaire permanente : 7 h équivalent-cours/semaine.** "
-            f"Cours : {charge_connecte['cours']:.2f} h ; TD : {charge_connecte['td']:.2f} h ; "
-            f"TP : {charge_connecte['tp']:.2f} h. Charge équivalente : "
-            f"{charge_connecte['total_eq']:.2f} h ; dépassement : {depassement_connecte:.2f} h éq-cours. "
-            "Les TD et TP sont convertis au taux de 1,5 h pour 1 h équivalent-cours."
-        )
     if not nom_arabe:
         st.warning(
             "Le fichier source ne contient pas encore le nom et le prénom en arabe. "
@@ -2092,48 +1855,6 @@ try:
     # ---- Emploi du temps individuel en grille (PDF, dimensions du modèle PPER.03) ----
     st.markdown("### 🗓️ Emploi du temps individuel (grille PDF)")
     qualite_select = nettoyer_texte(ligne_pv.get("Qualité", "")) or "Enseignant"
-    enseignements_hsup_selectionnes = None
-    if "permanent" in qualite_select.casefold():
-        st.markdown("### ⚙️ Déclaration des enseignements à comptabiliser comme heures supplémentaires")
-        st.info(
-            "Sélectionnez uniquement les enseignements que vous souhaitez faire apparaître "
-            "dans votre état H.SUP. Les séances simultanées de même type (Cours, TD ou TP), "
-            "même si elles concernent plusieurs promotions, seront comptées une seule fois. "
-            "Cette sélection ne modifie pas l'emploi du temps affiché."
-        )
-        metadata_hsup = profil_compte.get("user_metadata") or {}
-        options_hsup = sorted({nettoyer_texte(x) for x in seances_enseignant["Enseignements"] if nettoyer_texte(x)})
-        deja_hsup = metadata_hsup.get("hsup_enseignements_retenus", []) or []
-        user_id_local = (profil_compte or {}).get("id")
-        if user_id_local:
-            prefs_local, err_local = _supabase_table_requete(
-                "hsup_preferences", "GET",
-                params="select=selected_teachings&user_id=eq." + urllib.parse.quote(str(user_id_local)),
-                admin=False
-            )
-            if not err_local and prefs_local:
-                deja_hsup = prefs_local[0].get("selected_teachings") or []
-        deja_hsup = [x for x in deja_hsup if x in options_hsup]
-        enseignements_hsup_selectionnes = st.multiselect(
-            "Enseignements retenus comme H.SUP (permanent uniquement)",
-            options=options_hsup, default=deja_hsup, key="hsup_enseignements_selection"
-        )
-        if st.button("💾 Enregistrer mes enseignements H.SUP", key="hsup_save_teachings", use_container_width=True):
-            ok_pref, erreur_pref = mettre_a_jour_metadonnees_compte({
-                "hsup_enseignements_retenus": enseignements_hsup_selectionnes
-            })
-            if ok_pref:
-                user_id_pref = (st.session_state.get("hsup_user") or {}).get("id")
-                ok_table, erreur_table = sauvegarder_preferences_hsup(
-                    user_id_pref, enseignant_select, enseignements_hsup_selectionnes
-                )
-                if ok_table:
-                    st.success("Votre sélection H.SUP est enregistrée dans votre compte et dans la table Supabase partagée.")
-                    st.rerun()
-                else:
-                    st.error("Métadonnées enregistrées, mais synchronisation de la table partagée impossible : " + erreur_table)
-            else:
-                st.error(f"Impossible d'enregistrer votre sélection : {erreur_pref}")
     if trouver_logo() is None:
         st.info(
             "logo.PNG introuvable à côté de app.py : le logo intégré de l'université est utilisé. "
@@ -2156,22 +1877,8 @@ try:
 
     if st.button("🚀 Générer l'état Excel officiel actualisé", type="primary",
                  use_container_width=True):
-        if "permanent" in qualite_select.casefold():
-            seances_pour_etat, charge_sem, hsup_eq = limiter_enseignements_au_depassement(
-                seances_enseignant, enseignements_hsup_selectionnes, seuil=7.0
-            )
-            st.info(
-                f"Charge réglementaire : 7 h éq-cours | Charge EDT : {charge_sem['total_eq']:.2f} h éq-cours "
-                f"| Dépassement maximal : {max(0, charge_sem['total_eq']-7):.2f} h éq-cours "
-                f"| H.SUP sélectionnées retenues : {hsup_eq:.2f} h éq-cours."
-            )
-            if seances_pour_etat.empty:
-                st.warning("Aucune H.SUP à générer : sélection vide ou charge hebdomadaire ne dépassant pas 7 h équivalent-cours.")
-                st.stop()
-        else:
-            seances_pour_etat = seances_enseignant.copy()
         buffer, total_general, details = generer_excel(
-            enseignant_select, seances_pour_etat, dict_noms_arabe,
+            enseignant_select, seances_enseignant, dict_noms_arabe,
             date_debut_cours, date_fin_comptabilisation, exclusions_par_mois,
             qualite_select
         )
@@ -2198,33 +1905,95 @@ try:
             "Accès administrateur confirmé. Vous pouvez préparer les emplois du temps "
             "et les états H.SUP de l'ensemble des enseignants."
         )
-        st.subheader("📚 Téléchargement groupé de tous les enseignants")
-        preferences_admin, exclus_admin, erreur_preferences = charger_preferences_hsup_admin()
-        if erreur_preferences:
-            st.error(
-                "Impossible de lire les préférences partagées Supabase : " + erreur_preferences +
-                " Configurez SUPABASE_SERVICE_ROLE_KEY et exécutez le script SQL fourni avec le code."
-            )
-        st.subheader("🚫 Exclure des enseignants des états H.SUP")
-        noms_deja_exclus = [n for n in liste_enseignants_actifs if normaliser_nom(n) in exclus_admin]
-        choix_exclusions = st.multiselect(
-            "Enseignants à exclure de la génération des états H.SUP",
-            options=liste_enseignants_actifs, default=noms_deja_exclus,
-            key="hsup_admin_exclusions"
+        # ---- Documents personnels de l'administrateur connecté ----
+        st.subheader("👤 Mes documents personnels — Administrateur")
+        st.markdown(
+            "Cette rubrique reprend les fonctionnalités du compte enseignant pour "
+            "l'administrateur connecté : téléchargement de son EDT individuel et génération "
+            "de son état H.SUP officiel. Les calculs utilisent votre identité, votre période "
+            "de comptabilisation et vos jours exclus."
         )
-        if st.button("💾 Enregistrer les exclusions administratives", key="hsup_admin_save_exclusions", use_container_width=True):
-            ok_excl, err_excl = mettre_a_jour_exclusions_admin(choix_exclusions, df_enseignants)
-            if ok_excl:
-                st.success("Exclusions administratives enregistrées dans Supabase.")
-                st.rerun()
-            else:
-                st.error("Enregistrement des exclusions impossible : " + err_excl)
+
+        st.markdown("#### 🗓️ Mon emploi du temps individuel")
         st.caption(
-            "Les sélections d'enseignements de chaque permanent sont lues dans la table "
-            "Supabase partagée. Un permanent sans sélection enregistrée n'aura aucune H.SUP. "
-            "La table doit être créée avec le script SQL fourni et la clé service_role doit rester "
-            "uniquement dans les Secrets Streamlit (jamais dans le dépôt GitHub)."
+            f"Enseignant connecté : **{enseignant_select}** — "
+            f"{len(seances_enseignant)} séance(s) trouvée(s) dans l'EDT."
         )
+        if seances_enseignant.empty:
+            st.warning(
+                "Aucune séance n'a été trouvée pour votre nom dans le fichier EDT. "
+                "Vérifiez la correspondance de votre identité dans le fichier source."
+            )
+        else:
+            st.dataframe(
+                seances_enseignant[
+                    [c for c in ["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]
+                     if c in seances_enseignant.columns]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.download_button(
+                label="📥 Télécharger mon EDT individuel (PDF)",
+                data=generer_pdf_edt([(enseignant_select, qualite_select, seances_enseignant)]),
+                file_name=nom_fichier_edt(enseignant_select),
+                mime="application/pdf",
+                use_container_width=True,
+                key="admin_download_edt_personnel",
+            )
+
+        st.divider()
+        st.markdown("#### 📊 Mon état individuel des heures supplémentaires")
+        st.caption(
+            f"Période : du {date_debut_cours.strftime('%d/%m/%Y')} "
+            f"au {date_fin_comptabilisation.strftime('%d/%m/%Y')} inclus."
+        )
+        if st.button(
+            "🚀 Générer mon état H.SUP officiel (Excel)",
+            type="primary",
+            use_container_width=True,
+            key="admin_generer_etat_personnel",
+        ):
+            buffer_admin_perso, total_admin_perso, details_admin_perso = generer_excel(
+                enseignant_select,
+                seances_enseignant,
+                dict_noms_arabe,
+                date_debut_cours,
+                date_fin_comptabilisation,
+                exclusions_par_mois,
+                qualite_select,
+            )
+            nom_admin_clean = normaliser_nom(enseignant_select).replace(" ", "_")
+            st.session_state["admin_etat_personnel_pret"] = {
+                "data": buffer_admin_perso.getvalue(),
+                "total": total_admin_perso,
+                "details": details_admin_perso,
+                "nom": f"Etat_HSUP_Administrateur_{nom_admin_clean}_2026_2027.xlsx",
+            }
+
+        etat_admin_pret = st.session_state.get("admin_etat_personnel_pret")
+        if etat_admin_pret:
+            st.success(
+                "Votre état personnel est prêt. Total calculé sur les dates admissibles : "
+                f"{format_heures_arabe(etat_admin_pret['total']) or '0سا'}."
+            )
+            st.download_button(
+                label="📥 Télécharger mon état H.SUP individuel (Excel)",
+                data=etat_admin_pret["data"],
+                file_name=etat_admin_pret["nom"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="admin_download_etat_personnel",
+            )
+            with st.expander("🔎 Vérification du calcul jour par jour"):
+                st.dataframe(
+                    pd.DataFrame(etat_admin_pret["details"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        st.divider()
+        st.subheader("📚 Téléchargement groupé de tous les enseignants")
         st.markdown(
             "Un seul classeur Excel multifeuille contenant un index cliquable, "
             "un récapitulatif des charges Cours/TD/TP et une fiche officielle par enseignant."
@@ -2294,16 +2063,9 @@ try:
         if st.button("📦 Générer le classeur Excel de tous les enseignants",
                      type="primary", use_container_width=True):
             with st.spinner("Génération des fiches de tous les enseignants..."):
-                preferences_admin, exclus_admin, erreur_preferences = charger_preferences_hsup_admin()
-                if erreur_preferences:
-                    st.error("Génération interrompue : préférences Supabase indisponibles. " + erreur_preferences)
-                    st.stop()
-                liste_a_generer = [n for n in liste_enseignants_actifs
-                                   if normaliser_nom(n) not in exclus_admin]
                 buffer_groupe, nb_fiches = generer_excel_groupe(
-                    df_enseignants, df_edt, liste_a_generer, dict_noms_arabe,
-                    date_debut_cours, date_fin_comptabilisation, exclusions_par_mois,
-                    selections_hsup_par_enseignant=preferences_admin
+                    df_enseignants, df_edt, liste_enseignants_actifs, dict_noms_arabe,
+                    date_debut_cours, date_fin_comptabilisation, exclusions_par_mois
                 )
             st.success(f"Classeur groupé généré : {nb_fiches} fiches individuelles.")
             st.download_button(

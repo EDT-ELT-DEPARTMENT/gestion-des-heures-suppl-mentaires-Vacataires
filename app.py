@@ -606,7 +606,15 @@ def calculer_charge_equivalente_hebdomadaire(seances):
             "seances_uniques": int(len(uniques))}
 
 
-def limiter_enseignements_au_depassement(seances_toutes, enseignements_retenus, seuil=7.0):
+# Plafond hebdomadaire des H.SUP comptabilisées (en heures équivalent-cours).
+# Mettre PLAFOND_HSUP_EN_EQUIVALENT à False pour appliquer le plafond aux heures
+# physiques (durée réelle des séances) au lieu de l'équivalent-cours.
+PLAFOND_HSUP_HEBDO = 12.0
+PLAFOND_HSUP_EN_EQUIVALENT = True
+
+
+def limiter_enseignements_au_depassement(seances_toutes, enseignements_retenus, seuil=7.0,
+                                         plafond=PLAFOND_HSUP_HEBDO):
     """Retient les séances choisies dans la limite du dépassement hebdomadaire.
 
     L'allocation suit l'ordre chronologique des séances dans la semaine. Si le
@@ -615,6 +623,8 @@ def limiter_enseignements_au_depassement(seances_toutes, enseignements_retenus, 
     """
     charge = calculer_charge_equivalente_hebdomadaire(seances_toutes)
     depassement = max(0.0, charge["total_eq"] - float(seuil))
+    if plafond is not None and PLAFOND_HSUP_EN_EQUIVALENT:
+        depassement = min(depassement, float(plafond))
     retenus = filtrer_enseignements_hsup(seances_toutes, "permanent", enseignements_retenus)
     retenus = dedoublonner_seances_simultanees(retenus)
     if retenus.empty or depassement <= 0:
@@ -633,6 +643,9 @@ def limiter_enseignements_au_depassement(seances_toutes, enseignements_retenus, 
     travail = travail.sort_values(["_JOUR_ORDRE", "_DEBUT_ORDRE"], kind="stable")
 
     restant = depassement
+    heures_phys_restantes = (
+        float(plafond) if (plafond is not None and not PLAFOND_HSUP_EN_EQUIVALENT) else float("inf")
+    )
     lignes = []
     total_retenu_eq = 0.0
     for _, row in travail.iterrows():
@@ -641,9 +654,10 @@ def limiter_enseignements_au_depassement(seances_toutes, enseignements_retenus, 
         if facteur is None or restant <= 1e-9:
             continue
         duree = max(0.0, float(row.get("DUREE_H", 0) or 0))
-        duree_autorisee = min(duree, restant * facteur)
+        duree_autorisee = min(duree, restant * facteur, heures_phys_restantes)
         if duree_autorisee <= 1e-9:
             continue
+        heures_phys_restantes -= duree_autorisee
         copie = row.copy()
         copie["DUREE_H"] = round(duree_autorisee, 6)
         copie["DUREE_H_INITIALE"] = duree
@@ -2222,6 +2236,17 @@ def charger_historique_generations(limite=500):
     return (resultat or []), erreur
 
 
+def effacer_historique_generations():
+    """Supprime toutes les lignes de l'historique des générations (admin, service_role)."""
+    _, erreur = _supabase_table_requete(
+        "hsup_generation_history",
+        "DELETE",
+        params="id=not.is.null",
+        admin=True,
+    )
+    return (erreur is None), erreur
+
+
 def generer_excel_historique(historique):
     """Génère un classeur Excel contenant l'historique des générations H.SUP."""
     colonnes = [
@@ -3586,6 +3611,26 @@ try:
                 use_container_width=True,
                 key="download_historique_generations",
             )
+
+            st.markdown("##### 🗑️ Effacer l'historique")
+            confirmer_effacement_historique = st.checkbox(
+                "Je confirme vouloir effacer définitivement tout l'historique "
+                "(pensez à le télécharger avant).",
+                key="confirm_effacer_historique",
+            )
+            if st.button(
+                "🗑️ Effacer l'historique des générations",
+                key="btn_effacer_historique",
+                disabled=not confirmer_effacement_historique,
+                use_container_width=True,
+            ):
+                ok_effacement, erreur_effacement = effacer_historique_generations()
+                if ok_effacement:
+                    st.success("L'historique des générations a été effacé.")
+                    st.session_state.pop("confirm_effacer_historique", None)
+                    st.rerun()
+                else:
+                    st.error("Effacement impossible : " + nettoyer_texte(erreur_effacement))
 
     else:
         st.divider()

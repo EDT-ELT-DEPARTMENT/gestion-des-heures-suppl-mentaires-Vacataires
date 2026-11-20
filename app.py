@@ -2911,8 +2911,9 @@ try:
             if "permanent" not in qualite_reglage.casefold():
                 continue
 
-            seances_reglage = df_edt[
-                df_edt["Enseignants"].apply(
+            # Utiliser l'EDT complet : toutes les charges, tous départements.
+            seances_reglage = df_edt_complet[
+                df_edt_complet["Enseignants"].apply(
                     lambda x: correspond_enseignant(x, nom_norm_reglage)
                 )
             ].copy()

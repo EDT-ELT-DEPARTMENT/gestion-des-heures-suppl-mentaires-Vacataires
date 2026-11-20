@@ -1994,7 +1994,7 @@ try:
             "L'espace administration n'est pas activé pour ce compte. "
             "Pour donner l'accès administrateur, ajoutez l'adresse e-mail utilisée pour "
             "vous connecter dans HSUP_ADMIN_EMAILS dans le fichier .streamlit/secrets.toml, "
-            "puis redémarrez Streamlit. Exemple : HSUP_ADMIN_EMAILS = \"admin@exemple.com\"."
+            "puis redémarrez Streamlit. Exemple : HSUP_ADMIN_EMAILS = \"milouafarid@gmail.com\"."
         )
 except Exception as e:
     st.error(f"Une erreur est survenue lors du traitement : {e}")

@@ -611,7 +611,7 @@ def calculer_charge_equivalente_hebdomadaire(seances):
 # Mettre PLAFOND_HSUP_EN_EQUIVALENT à False pour appliquer le plafond aux heures
 # physiques (durée réelle des séances) au lieu de l'équivalent-cours.
 PLAFOND_HSUP_HEBDO = 12.0
-PLAFOND_HSUP_EN_EQUIVALENT = True
+PLAFOND_HSUP_EN_EQUIVALENT = False
 
 # Reliquat : si les séances cochées ne couvrent pas tout le dépassement (charge
 # totale - 7 h), la différence est prise sur la fin de semaine parmi les séances
@@ -2298,8 +2298,13 @@ def simuler_suppression_hsup(seances_toutes, selections, labels_supprimes):
         retenues, charge, hs_eq = limiter_enseignements_au_depassement(seances, selections, seuil=7.0)
         brut = max(0.0, charge.get("total_eq_brut", charge["total_eq"]) - 7.0)
         phys = float(pd.to_numeric(retenues["DUREE_H"], errors="coerce").fillna(0).sum()) if not retenues.empty else 0.0
+        # H.SUP avant plafond (pour savoir si le plafond est dépassé).
+        retenues_nc, _, _ = limiter_enseignements_au_depassement(seances, selections, seuil=7.0, plafond=None)
+        phys_brut = float(pd.to_numeric(retenues_nc["DUREE_H"], errors="coerce").fillna(0).sum()) if not retenues_nc.empty else 0.0
+        mesure_plafond = brut if PLAFOND_HSUP_EN_EQUIVALENT else phys_brut
         return {"charge": charge, "depassement_brut": brut, "hsup_eq": hs_eq,
-                "hsup_phys": round(phys, 2), "retenues": retenues}
+                "hsup_phys": round(phys, 2), "hsup_phys_brut": round(phys_brut, 2),
+                "mesure_plafond": mesure_plafond, "retenues": retenues}
 
     return _calc(seances_toutes), _calc(restantes), indices_supprimes
 
@@ -2410,6 +2415,17 @@ def construire_plan_edt(df_complet, df_enseignants, demandes, selections_par_nom
             modifier[i] = _reconstruire_cellule_enseignants(noms, seps, garder)
     return {"supprimer": supprimer, "modifier": modifier,
             "details": details, "avertissements": avertissements}
+
+
+def appliquer_plan_edt(df, plan):
+    """Copie du DataFrame EDT sans les lignes supprimées et avec les cellules « Enseignants » modifiées."""
+    if df is None or not plan:
+        return df
+    resultat = df.copy()
+    for i, texte in plan["modifier"].items():
+        if i in resultat.index:
+            resultat.at[i, "Enseignants"] = texte
+    return resultat.drop(index=[i for i in plan["supprimer"] if i in resultat.index])
 
 
 def generer_edt_sans_suppressions(indices_a_supprimer, modifications_enseignants=None):
@@ -3374,6 +3390,7 @@ try:
         if "edt_suppressions_validees" not in st.session_state:
             st.session_state["edt_suppressions_validees"] = {}
 
+        plan_edt_effectif = None
         if not permanents_sim:
             st.info("Sélectionnez d'abord au moins un enseignant permanent dans « Enseignants à inclure dans les états H.SUP Excel ».")
         else:
@@ -3408,10 +3425,11 @@ try:
                     {"Indicateur": "Charge totale (éq-cours)", "Avant": _fmt(avant["charge"]["total_eq"]), "Après": _fmt(apres["charge"]["total_eq"])},
                     {"Indicateur": "Dépassement sur 7 h (avant plafond)", "Avant": _fmt(avant["depassement_brut"]), "Après": _fmt(apres["depassement_brut"])},
                     {"Indicateur": "H.SUP retenues / semaine (éq-cours)", "Avant": _fmt(avant["hsup_eq"]), "Après": _fmt(apres["hsup_eq"])},
-                    {"Indicateur": "H.SUP physiques / semaine", "Avant": _fmt(avant["hsup_phys"]), "Après": _fmt(apres["hsup_phys"])},
+                    {"Indicateur": "H.SUP physiques / semaine (avant plafond)", "Avant": _fmt(avant["hsup_phys_brut"]), "Après": _fmt(apres["hsup_phys_brut"])},
+                    {"Indicateur": "H.SUP physiques / semaine (retenues, après plafond)", "Avant": _fmt(avant["hsup_phys"]), "Après": _fmt(apres["hsup_phys"])},
                     {"Indicateur": f"Plafond {plafond_txt} respecté sans troncature ?",
-                     "Avant": "Oui" if avant["depassement_brut"] <= PLAFOND_HSUP_HEBDO + 1e-9 else "Non",
-                     "Après": "Oui" if apres["depassement_brut"] <= PLAFOND_HSUP_HEBDO + 1e-9 else "Non"},
+                     "Avant": "Oui" if avant["mesure_plafond"] <= PLAFOND_HSUP_HEBDO + 1e-9 else "Non",
+                     "Après": "Oui" if apres["mesure_plafond"] <= PLAFOND_HSUP_HEBDO + 1e-9 else "Non"},
                     {"Indicateur": "Séances supprimées", "Avant": "0", "Après": str(len(indices_sim))},
                 ])
                 st.dataframe(tableau_sim, use_container_width=True, hide_index=True)
@@ -3450,6 +3468,7 @@ try:
                 plan_final = construire_plan_edt(
                     df_edt_complet, df_enseignants, validees, selections_toutes_val
                 )
+                plan_edt_effectif = plan_final
                 lignes_val = [
                     {"Enseignant": nn, "Enseignement supprimé": lab}
                     for nn, labels in validees.items() for lab in labels
@@ -3477,6 +3496,15 @@ try:
                         "Pour que les états H.SUP utilisent ce nouvel EDT, remplacez le fichier EDT "
                         "d'origine du dépôt par ce fichier, puis redémarrez l'application."
                     )
+
+        # Les suppressions validées s'appliquent aux états H.SUP générés ci-dessous (session en cours).
+        if plan_edt_effectif and (plan_edt_effectif["supprimer"] or plan_edt_effectif["modifier"]):
+            df_edt_complet = appliquer_plan_edt(df_edt_complet, plan_edt_effectif)
+            df_edt = appliquer_plan_edt(df_edt, plan_edt_effectif)
+            st.info(
+                "✅ Les états H.SUP Excel ci-dessous tiennent compte des suppressions validées "
+                "(simulation ci-dessus). Annulez-les pour revenir à l'EDT d'origine."
+            )
 
         if st.button(
             "🗓️ Préparer les états H.SUP Excel",

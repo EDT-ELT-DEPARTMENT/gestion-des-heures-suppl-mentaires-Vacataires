@@ -411,6 +411,57 @@ def charger_donnees():
     return df_enseignants, df_edt, dict_arabe, sorted(set(actifs))
 
 
+def charger_edt_complet():
+    """Charge l'EDT complet, sans filtrer par département.
+
+    Cette version conserve toutes les charges d'un enseignant, y compris celles
+    assurées dans d'autres départements, afin de pouvoir les afficher dans
+    l'emploi du temps individuel par département et par promotion.
+    """
+    df_edt_complet = pd.read_excel(FICHIER_EDT, sheet_name=0, dtype=str)
+    df_edt_complet.columns = [nettoyer_texte(c) for c in df_edt_complet.columns]
+
+    obligatoires = ["Enseignements", "Enseignants", "Horaire", "Jours"]
+    for colonne in obligatoires:
+        if colonne not in df_edt_complet.columns:
+            raise ValueError(
+                "Colonne manquante dans l'EDT complet : " + colonne
+            )
+
+    for colonne in obligatoires:
+        df_edt_complet[colonne] = df_edt_complet[colonne].fillna("").astype(str).str.strip()
+
+    if "Département" in df_edt_complet.columns:
+        df_edt_complet["Département"] = (
+            df_edt_complet["Département"].fillna("").astype(str).str.strip()
+        )
+    else:
+        df_edt_complet["Département"] = ""
+
+    if "Promotion" in df_edt_complet.columns:
+        df_edt_complet["Promotion"] = (
+            df_edt_complet["Promotion"].fillna("").astype(str).str.strip()
+        )
+    else:
+        df_edt_complet["Promotion"] = ""
+
+    if "Lieu" in df_edt_complet.columns:
+        df_edt_complet["Lieu"] = (
+            df_edt_complet["Lieu"].fillna("").astype(str).str.strip()
+        )
+    else:
+        df_edt_complet["Lieu"] = ""
+
+    df_edt_complet["JOUR_NORM"] = df_edt_complet["Jours"].apply(
+        lambda x: normaliser_nom(x).lower()
+    )
+    df_edt_complet["DUREE_H"] = df_edt_complet["Horaire"].apply(
+        lambda x: duree_seance_heures(x) if x else 0.0
+    )
+
+    return df_edt_complet
+
+
 def dates_du_mois(annee, mois):
     nb = calendar.monthrange(annee, mois)[1]
     return [date(annee, mois, j) for j in range(1, nb + 1)]
@@ -1435,26 +1486,43 @@ def _edt_creneau(horaire):
 
 
 def _edt_lignes_case(seances_case, largeur_utile):
-    """Lignes de texte d'une case : enseignement (renvoyé à la ligne), lieu, promotion(s).
+    """Lignes de texte d'une case : département, enseignement, lieu et promotion(s).
 
-    Les séances identiques (même enseignement, même lieu) données à plusieurs
-    promotions au même créneau sont regroupées : « M1CE, M1ER, M1ME ».
+    Les séances identiques (même département, même enseignement, même lieu)
+    données à plusieurs promotions au même créneau sont regroupées :
+    « M1CE, M1ER, M1ME ».
     """
     from reportlab.lib.utils import simpleSplit
     groupes = {}
     for _, seance in seances_case:
-        cle = (_edt_texte(seance.get("Enseignements", "")), _edt_texte(seance.get("Lieu", "")))
+        departement = _edt_texte(seance.get("Département", "")) or "Non précisé"
+        cle = (
+            departement,
+            _edt_texte(seance.get("Enseignements", "")),
+            _edt_texte(seance.get("Lieu", "")),
+        )
         promo = _edt_texte(seance.get("Promotion", ""))
         groupes.setdefault(cle, [])
         if promo and promo not in groupes[cle]:
             groupes[cle].append(promo)
+
     lignes = []
-    for (intitule, lieu), promos in groupes.items():
-        lignes += simpleSplit(intitule, "Helvetica", EDT_TAILLE_CASE, largeur_utile) or [""]
+    for (departement, intitule, lieu), promos in groupes.items():
+        lignes += simpleSplit(
+            f"Département : {departement}",
+            "Helvetica",
+            EDT_TAILLE_CASE,
+            largeur_utile,
+        ) or [""]
+        lignes += simpleSplit(
+            intitule, "Helvetica", EDT_TAILLE_CASE, largeur_utile
+        ) or [""]
         if lieu:
             lignes.append(lieu)
         if promos:
-            lignes += simpleSplit(", ".join(promos), "Helvetica", EDT_TAILLE_CASE, largeur_utile)
+            lignes += simpleSplit(
+                ", ".join(promos), "Helvetica", EDT_TAILLE_CASE, largeur_utile
+            )
     return lignes
 
 
@@ -1730,128 +1798,6 @@ def mettre_a_jour_exclusions_admin(noms_exclus, df_enseignants=None):
     return (erreur is None), (erreur or "")
 
 
-def enregistrer_historique_generation(
-    generation_type,
-    enseignants,
-    format_fichier,
-    nom_fichier,
-    statut="Succès",
-    message="",
-    total_hsup=None,
-):
-    """Enregistre une génération d'état H.SUP dans l'historique Supabase."""
-    profil = st.session_state.get("hsup_user") or {}
-    email_admin = nettoyer_texte(profil.get("email", ""))
-
-    if isinstance(enseignants, str):
-        liste_enseignants = [enseignants]
-    else:
-        liste_enseignants = [nettoyer_texte(x) for x in (enseignants or []) if nettoyer_texte(x)]
-
-    payload = {
-        "generated_by": email_admin,
-        "generation_type": nettoyer_texte(generation_type),
-        "teachers": liste_enseignants,
-        "teacher_count": len(liste_enseignants),
-        "period_start": date_debut_cours.isoformat(),
-        "period_end": date_fin_comptabilisation.isoformat(),
-        "file_format": nettoyer_texte(format_fichier),
-        "file_name": nettoyer_texte(nom_fichier),
-        "status": nettoyer_texte(statut) or "Succès",
-        "message": nettoyer_texte(message),
-        "total_hsup": None if total_hsup is None else str(total_hsup),
-    }
-
-    _, erreur = _supabase_table_requete(
-        "hsup_generation_history", "POST", payload, admin=True
-    )
-    return (erreur is None), (erreur or "")
-
-
-def charger_historique_generations(limite=500):
-    """Charge l'historique des générations d'états H.SUP, du plus récent au plus ancien."""
-    resultat, erreur = _supabase_table_requete(
-        "hsup_generation_history",
-        "GET",
-        params=(
-            "select=id,created_at,generated_by,generation_type,teachers,"
-            "teacher_count,period_start,period_end,file_format,file_name,"
-            "status,message,total_hsup"
-            f"&order=created_at.desc&limit={int(limite)}"
-        ),
-        admin=True,
-    )
-    return (resultat or []), erreur
-
-
-def generer_excel_historique(historique):
-    """Génère un classeur Excel contenant l'historique des générations H.SUP."""
-    colonnes = [
-        "Date et heure",
-        "Administrateur",
-        "Type de génération",
-        "Nombre d'enseignants",
-        "Enseignants",
-        "Début de période",
-        "Fin de période",
-        "Format du fichier",
-        "Nom du fichier",
-        "Statut",
-        "Message",
-        "Total H.SUP",
-    ]
-
-    lignes = []
-    for ligne in historique:
-        enseignants = ligne.get("teachers") or []
-        if isinstance(enseignants, str):
-            enseignants = [enseignants]
-
-        lignes.append({
-            "Date et heure": nettoyer_texte(ligne.get("created_at", "")),
-            "Administrateur": nettoyer_texte(ligne.get("generated_by", "")),
-            "Type de génération": nettoyer_texte(ligne.get("generation_type", "")),
-            "Nombre d'enseignants": ligne.get("teacher_count", len(enseignants)),
-            "Enseignants": " ; ".join(nettoyer_texte(x) for x in enseignants),
-            "Début de période": nettoyer_texte(ligne.get("period_start", "")),
-            "Fin de période": nettoyer_texte(ligne.get("period_end", "")),
-            "Format du fichier": nettoyer_texte(ligne.get("file_format", "")),
-            "Nom du fichier": nettoyer_texte(ligne.get("file_name", "")),
-            "Statut": nettoyer_texte(ligne.get("status", "")),
-            "Message": nettoyer_texte(ligne.get("message", "")),
-            "Total H.SUP": nettoyer_texte(ligne.get("total_hsup", "")),
-        })
-
-    df_historique = pd.DataFrame(lignes, columns=colonnes)
-
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df_historique.to_excel(writer, sheet_name="Historique H.SUP", index=False)
-
-        ws = writer.sheets["Historique H.SUP"]
-        largeurs = {
-            "A": 22, "B": 32, "C": 30, "D": 18, "E": 60, "F": 16, "G": 16,
-            "H": 28, "I": 45, "J": 14, "K": 45, "L": 18,
-        }
-        for colonne, largeur in largeurs.items():
-            ws.column_dimensions[colonne].width = largeur
-
-        for cellule in ws[1]:
-            cellule.font = openpyxl.styles.Font(bold=True)
-            cellule.fill = openpyxl.styles.PatternFill(
-                start_color="D9EAF7", end_color="D9EAF7", fill_type="solid"
-            )
-            cellule.alignment = openpyxl.styles.Alignment(
-                horizontal="center", vertical="center", wrap_text=True
-            )
-
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-
-    buffer.seek(0)
-    return buffer, df_historique
-
-
 def authentifier_enseignant(liste_enseignants):
     """Inscription/connexion. L'identité française est liée au référentiel EDT."""
     url, anon_key, admins, service_role = _supabase_config()
@@ -2009,6 +1955,7 @@ def lire_date_compte(valeur, defaut):
 
 try:
     df_enseignants, df_edt, dict_noms_arabe, liste_enseignants_actifs = charger_donnees()
+    df_edt_complet = charger_edt_complet()
     enseignant_connecte, est_administrateur, profil_compte = authentifier_enseignant(
         liste_enseignants_actifs
     )
@@ -2062,6 +2009,11 @@ try:
     nom_norm = normaliser_nom(enseignant_select)
     seances_enseignant = df_edt[
         df_edt["Enseignants"].apply(lambda x: correspond_enseignant(x, nom_norm))
+    ].copy()
+
+    # Toutes les charges de l'enseignant, tous départements et promotions confondus.
+    seances_enseignant_complet = df_edt_complet[
+        df_edt_complet["Enseignants"].apply(lambda x: correspond_enseignant(x, nom_norm))
     ].copy()
 
     # Contrôles de calendrier : les jours fériés sont exclus automatiquement.
@@ -2263,7 +2215,9 @@ try:
         )
     st.download_button(
         label="📥 Télécharger l'emploi du temps individuel (PDF)",
-        data=generer_pdf_edt([(enseignant_select, qualite_select, seances_enseignant)]),
+        data=generer_pdf_edt([
+            (enseignant_select, qualite_select, seances_enseignant_complet)
+        ]),
         file_name=nom_fichier_edt(enseignant_select),
         mime="application/pdf",
         use_container_width=True,
@@ -2299,19 +2253,6 @@ try:
         )
         nom_fichier_clean = normaliser_nom(enseignant_select).replace(" ", "_")
         file_name = f"Etat_HSUP_Enseignant_{nom_fichier_clean}_2026_2027.xlsx"
-
-        ok_historique_individuel, erreur_historique_individuel = enregistrer_historique_generation(
-            generation_type="État H.SUP individuel",
-            enseignants=[enseignant_select],
-            format_fichier="Excel individuel",
-            nom_fichier=file_name,
-            statut="Succès",
-            message=(
-                f"Total H.SUP calculé sur la période : "
-                f"{format_heures_arabe(total_general) or '0سا'}."
-            ),
-            total_hsup=format_heures_arabe(total_general) or "0سا",
-        )
         st.success(
             f"État Excel généré. Total calculé sur les dates admissibles : "
             f"{format_heures_arabe(total_general) or '0سا'}."
@@ -2390,8 +2331,10 @@ try:
                 liste_edt = []
                 for nom_edt in selection_edt:
                     n_norm = normaliser_nom(nom_edt)
-                    seances_edt = df_edt[
-                        df_edt["Enseignants"].apply(lambda x: correspond_enseignant(x, n_norm))
+                    seances_edt = df_edt_complet[
+                        df_edt_complet["Enseignants"].apply(
+                            lambda x: correspond_enseignant(x, n_norm)
+                        )
                     ].copy()
                     if seances_edt.empty:
                         continue
@@ -2426,256 +2369,6 @@ try:
                 use_container_width=True, key="download_edt_selection",
             )
 
-        # ---- Etats des heures sups en Excel : un ou plusieurs enseignants ----
-        st.markdown("#### 🗓️ Etats des heures sups en Excel (un ou plusieurs enseignants)")
-        st.caption(
-            "Générez les états H.SUP Excel pour un ou plusieurs enseignants. "
-            "Les enseignants exclus administrativement ne sont pas inclus. "
-            "Pour les permanents, seuls les enseignements déclarés H.SUP dans Supabase sont retenus."
-        )
-
-        tous_hsup_excel = st.checkbox(
-            "Sélectionner tous les enseignants éligibles",
-            key="hsup_excel_tous",
-        )
-
-        enseignants_hsup_eligibles = [
-            n for n in liste_enseignants_actifs
-            if normaliser_nom(n) not in exclus_admin
-        ]
-
-        choix_hsup_excel = st.multiselect(
-            "Enseignants à inclure dans les états H.SUP Excel",
-            options=enseignants_hsup_eligibles,
-            default=[enseignant_select] if enseignant_select in enseignants_hsup_eligibles else [],
-            disabled=tous_hsup_excel,
-            key="hsup_excel_choix",
-        )
-
-        format_hsup_excel = st.radio(
-            "Format du téléchargement Excel",
-            [
-                "Un seul classeur Excel multifeuille",
-                "Un fichier Excel par enseignant (fichier ZIP)",
-            ],
-            horizontal=True,
-            key="hsup_excel_format",
-        )
-
-        choisis_hsup_excel = (
-            set(enseignants_hsup_eligibles)
-            if tous_hsup_excel
-            else set(choix_hsup_excel)
-        )
-
-        selection_hsup_excel = [
-            n for n in liste_enseignants_actifs
-            if n in choisis_hsup_excel and normaliser_nom(n) not in exclus_admin
-        ]
-
-        st.caption(
-            f"{len(selection_hsup_excel)} enseignant(s) sélectionné(s) pour les états H.SUP Excel."
-        )
-
-        if st.button(
-            "🗓️ Préparer les états H.SUP Excel",
-            use_container_width=True,
-            disabled=not selection_hsup_excel,
-            key="hsup_excel_preparer",
-        ):
-            with st.spinner("Génération des états H.SUP Excel..."):
-
-                preferences_admin_hsup_excel, exclus_admin_hsup_excel, erreur_preferences_hsup_excel = (
-                    charger_preferences_hsup_admin()
-                )
-
-                if erreur_preferences_hsup_excel:
-                    st.session_state.pop("hsup_excel_pret", None)
-                    st.error(
-                        "Génération interrompue : préférences Supabase indisponibles. "
-                        + erreur_preferences_hsup_excel
-                    )
-                else:
-                    liste_hsup_excel = []
-
-                    for nom_hsup_excel in selection_hsup_excel:
-                        nom_norm_hsup_excel = normaliser_nom(nom_hsup_excel)
-
-                        ligne_hsup_excel = df_enseignants[
-                            df_enseignants["NOM_NORM"].eq(nom_norm_hsup_excel)
-                        ]
-
-                        if ligne_hsup_excel.empty:
-                            continue
-
-                        qualite_hsup_excel = nettoyer_texte(
-                            ligne_hsup_excel.iloc[0].get("Qualité", "")
-                        ) or "Enseignant"
-
-                        seances_hsup_excel = df_edt[
-                            df_edt["Enseignants"].apply(
-                                lambda x: correspond_enseignant(x, nom_norm_hsup_excel)
-                            )
-                        ].copy()
-
-                        if seances_hsup_excel.empty:
-                            continue
-
-                        if "permanent" in qualite_hsup_excel.casefold():
-                            enseignements_retenus_hsup_excel = (
-                                preferences_admin_hsup_excel.get(
-                                    nom_norm_hsup_excel, []
-                                )
-                            )
-
-                            seances_pour_etat_hsup_excel, charge_semaine_hsup_excel, hsup_equivalent_hsup_excel = (
-                                limiter_enseignements_au_depassement(
-                                    seances_hsup_excel,
-                                    enseignements_retenus_hsup_excel,
-                                    seuil=7.0,
-                                )
-                            )
-                        else:
-                            seances_pour_etat_hsup_excel = seances_hsup_excel.copy()
-
-                        if seances_pour_etat_hsup_excel.empty:
-                            continue
-
-                        liste_hsup_excel.append(
-                            (
-                                nom_hsup_excel,
-                                qualite_hsup_excel,
-                                seances_pour_etat_hsup_excel,
-                            )
-                        )
-
-                    if not liste_hsup_excel:
-                        st.session_state.pop("hsup_excel_pret", None)
-                        st.warning(
-                            "Aucun état H.SUP Excel ne peut être généré pour la sélection. "
-                            "Vérifiez les séances EDT et, pour les permanents, les enseignements H.SUP enregistrés."
-                        )
-                    elif format_hsup_excel.startswith("Un fichier Excel par enseignant"):
-
-                        buffer_zip_hsup_excel = io.BytesIO()
-
-                        with zipfile.ZipFile(
-                            buffer_zip_hsup_excel,
-                            mode="w",
-                            compression=zipfile.ZIP_DEFLATED,
-                        ) as archive_zip_hsup_excel:
-
-                            for nom_fiche_hsup_excel, qualite_fiche_hsup_excel, seances_fiche_hsup_excel in liste_hsup_excel:
-
-                                if "permanent" in qualite_fiche_hsup_excel.casefold():
-                                    enseignements_retenus_fiche_hsup_excel = (
-                                        preferences_admin_hsup_excel.get(
-                                            normaliser_nom(nom_fiche_hsup_excel),
-                                            [],
-                                        )
-                                    )
-
-                                    seances_fiche_hsup_excel, _, _ = (
-                                        limiter_enseignements_au_depassement(
-                                            seances_fiche_hsup_excel,
-                                            enseignements_retenus_fiche_hsup_excel,
-                                            seuil=7.0,
-                                        )
-                                    )
-                                else:
-                                    seances_fiche_hsup_excel = seances_fiche_hsup_excel.copy()
-
-                                if seances_fiche_hsup_excel.empty:
-                                    continue
-
-                                buffer_fiche_hsup_excel, total_fiche_hsup_excel, details_fiche_hsup_excel = (
-                                    generer_excel(
-                                        nom_fiche_hsup_excel,
-                                        seances_fiche_hsup_excel,
-                                        dict_noms_arabe,
-                                        date_debut_cours,
-                                        date_fin_comptabilisation,
-                                        exclusions_par_mois,
-                                        qualite_fiche_hsup_excel,
-                                    )
-                                )
-
-                                nom_fichier_hsup_excel = (
-                                    "EtatHSUP_"
-                                    + normaliser_nom(nom_fiche_hsup_excel).replace(" ", "_")
-                                    + "_2026_2027.xlsx"
-                                )
-
-                                archive_zip_hsup_excel.writestr(
-                                    nom_fichier_hsup_excel,
-                                    buffer_fiche_hsup_excel.getvalue(),
-                                )
-
-                        buffer_zip_hsup_excel.seek(0)
-
-                        st.session_state["hsup_excel_pret"] = {
-                            "data": buffer_zip_hsup_excel.getvalue(),
-                            "nom": "Etats_HSUP_Enseignants_ELT_2026_2027.zip",
-                            "mime": "application/zip",
-                            "ordre": [e[0] for e in liste_hsup_excel],
-                        }
-
-                        enregistrer_historique_generation(
-                            generation_type="États H.SUP Excel - sélection multiple",
-                            enseignants=[e[0] for e in liste_hsup_excel],
-                            format_fichier="ZIP Excel",
-                            nom_fichier="Etats_HSUP_Enseignants_ELT_2026_2027.zip",
-                            statut="Succès",
-                            message=f"{len(liste_hsup_excel)} fichier(s) Excel individuel(s) généré(s).",
-                        )
-
-                    else:
-                        buffer_hsup_excel, nombre_fiches_hsup_excel = generer_excel_groupe(
-                            df_enseignants,
-                            df_edt,
-                            selection_hsup_excel,
-                            dict_noms_arabe,
-                            date_debut_cours,
-                            date_fin_comptabilisation,
-                            exclusions_par_mois,
-                            selections_hsup_par_enseignant=preferences_admin_hsup_excel,
-                        )
-
-                        st.session_state["hsup_excel_pret"] = {
-                            "data": buffer_hsup_excel.getvalue(),
-                            "nom": "Etats_HSUP_Enseignants_Selectionnes_ELT_2026_2027.xlsx",
-                            "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            "ordre": selection_hsup_excel,
-                            "nombre_fiches": nombre_fiches_hsup_excel,
-                        }
-
-                        enregistrer_historique_generation(
-                            generation_type="États H.SUP Excel - sélection multiple",
-                            enseignants=selection_hsup_excel,
-                            format_fichier="Excel multifeuille",
-                            nom_fichier="Etats_HSUP_Enseignants_Selectionnes_ELT_2026_2027.xlsx",
-                            statut="Succès",
-                            message=f"{nombre_fiches_hsup_excel} fiche(s) H.SUP générée(s).",
-                        )
-
-        pret_hsup_excel = st.session_state.get("hsup_excel_pret")
-
-        if pret_hsup_excel:
-            st.success(
-                f"{len(pret_hsup_excel['ordre'])} état(s) H.SUP Excel prêt(s) : "
-                + " → ".join(pret_hsup_excel["ordre"][:8])
-                + (" …" if len(pret_hsup_excel["ordre"]) > 8 else "")
-            )
-
-            st.download_button(
-                label=f"📥 Télécharger les états H.SUP Excel ({pret_hsup_excel['nom']})",
-                data=pret_hsup_excel["data"],
-                file_name=pret_hsup_excel["nom"],
-                mime=pret_hsup_excel["mime"],
-                use_container_width=True,
-                key="download_hsup_excel_selection",
-            )
-
         if st.button("📦 Générer le classeur Excel de tous les enseignants",
                      type="primary", use_container_width=True):
             with st.spinner("Génération des fiches de tous les enseignants..."):
@@ -2691,16 +2384,6 @@ try:
                     selections_hsup_par_enseignant=preferences_admin
                 )
             st.success(f"Classeur groupé généré : {nb_fiches} fiches individuelles.")
-
-            ok_historique_groupe, erreur_historique_groupe = enregistrer_historique_generation(
-                generation_type="Classeur groupé - tous les enseignants",
-                enseignants=liste_a_generer,
-                format_fichier="Excel multifeuille",
-                nom_fichier="Etats_HSUP_Tous_Enseignants_ELT_2026_2027.xlsx",
-                statut="Succès",
-                message=f"{nb_fiches} fiche(s) H.SUP individuelle(s) générée(s).",
-            )
-
             st.download_button(
                 label="📥 Télécharger toutes les fiches H.SUP (Excel multifeuille)",
                 data=buffer_groupe,
@@ -2709,71 +2392,6 @@ try:
                 use_container_width=True,
                 key="download_hsup_groupe",
             )
-
-        # ---- Historique des générations des états H.SUP ----
-        st.divider()
-        st.markdown("#### 🕘 Historique des générations des états H.SUP")
-        st.caption(
-            "Cet historique enregistre chaque génération d'état H.SUP Excel : "
-            "génération individuelle, classeur groupé de tous les enseignants ou "
-            "génération Excel pour une sélection d'enseignants."
-        )
-
-        historique_generations, erreur_historique_generations = charger_historique_generations()
-
-        if erreur_historique_generations:
-            st.error(
-                "Impossible de charger l'historique des générations : "
-                + erreur_historique_generations
-            )
-        elif not historique_generations:
-            st.info("Aucune génération d'état H.SUP n'a encore été enregistrée.")
-        else:
-            lignes_historique = []
-
-            for ligne_historique in historique_generations:
-                enseignants_historique = ligne_historique.get("teachers") or []
-                if isinstance(enseignants_historique, str):
-                    enseignants_historique = [enseignants_historique]
-
-                lignes_historique.append({
-                    "Date et heure": nettoyer_texte(ligne_historique.get("created_at", "")),
-                    "Administrateur": nettoyer_texte(ligne_historique.get("generated_by", "")),
-                    "Type de génération": nettoyer_texte(ligne_historique.get("generation_type", "")),
-                    "Nombre d'enseignants": ligne_historique.get("teacher_count", len(enseignants_historique)),
-                    "Enseignants": " ; ".join(
-                        nettoyer_texte(x) for x in enseignants_historique
-                    ),
-                    "Début de période": nettoyer_texte(ligne_historique.get("period_start", "")),
-                    "Fin de période": nettoyer_texte(ligne_historique.get("period_end", "")),
-                    "Format du fichier": nettoyer_texte(ligne_historique.get("file_format", "")),
-                    "Nom du fichier": nettoyer_texte(ligne_historique.get("file_name", "")),
-                    "Statut": nettoyer_texte(ligne_historique.get("status", "")),
-                    "Message": nettoyer_texte(ligne_historique.get("message", "")),
-                    "Total H.SUP": nettoyer_texte(ligne_historique.get("total_hsup", "")),
-                })
-
-            df_historique_affichage = pd.DataFrame(lignes_historique)
-
-            st.dataframe(
-                df_historique_affichage,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            buffer_historique_excel, df_historique_telechargeable = generer_excel_historique(
-                historique_generations
-            )
-
-            st.download_button(
-                label="📥 Télécharger l'historique des générations (Excel)",
-                data=buffer_historique_excel,
-                file_name="Historique_Generations_Etats_HSUP_ELT_2026_2027.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key="download_historique_generations",
-            )
-
     else:
         st.divider()
         st.info(

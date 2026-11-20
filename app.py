@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Gestion et génération des états H.SUP des enseignants vacataires - ELT
+Gestion et génération des états H.SUP des enseignants permanents et vacataires - ELT
 Année universitaire 2026-2027.
 Le calcul est fondé sur les séances récurrentes de l'EDT et les dates réelles
 de chaque mois (pas sur une proratisation du volume hebdomadaire).
@@ -9,6 +9,9 @@ de chaque mois (pas sur une proratisation du volume hebdomadaire).
 import io
 import re
 import base64
+import json
+import urllib.request
+import urllib.error
 import calendar
 import copy
 import unicodedata
@@ -23,12 +26,12 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.properties import PageSetupProperties
 
 st.set_page_config(
-    page_title="Gestion H.SUP Vacataires - 2026-2027",
+    page_title="Gestion H.SUP Permanents et Vacataires - 2026-2027",
     page_icon="⚡",
     layout="wide",
 )
 
-TITRE_OFFICIEL = "Plateforme de gestion des EDTs et H.SUP - Vacataires - 2026-2027"
+TITRE_OFFICIEL = "Plateforme de gestion des EDTs et H.SUP - Permanents et Vacataires - 2026-2027"
 st.title(f"⚡ {TITRE_OFFICIEL}")
 st.markdown("**Département d'Électrotechnique - Faculté de génie électrique - UDL-SBA**")
 st.divider()
@@ -42,18 +45,27 @@ def choisir_fichier(nom_standard, variantes=()):
 
 FICHIER_PV = choisir_fichier(
     "Permanents-Vacataires-ELT2-2026-2027.xlsx",
-    ("Permanents-Vacataires-ELT2-2026-2027(3).xlsx",),
+    (
+        "Permanents-Vacataires-ELT2-2026-2027(3).xlsx",
+        "Permanents-Vacataires-ELT2-2026-2027(2).xlsx",
+        "Permanents-Vacataires-ELT2-2026-2027(1).xlsx",
+    ),
 )
 FICHIER_EDT = choisir_fichier(
     "dataEDT-ELT-S1-2027.xlsx",
-    ("dataEDT-ELT-S1-2027(5).xlsx",),
+    (
+        "dataEDT-ELT-S1-2027(6).xlsx",
+        "dataEDT-ELT-S1-2027(5).xlsx",
+        "dataEDT-ELT-S1-2027(3).xlsx",
+        "dataEDT-ELT-S1-2027(1).xlsx",
+    ),
 )
 # Le fichier récent contient séparément « الاسم : » et « اللقب : ».
 FICHIER_COORD = choisir_fichier(
     "Vos coordonnées en Arabe (réponses)(1).xlsx",
     ("Vos coordonnées en Arabe (réponses).xlsx",),
 )
-FICHIER_TEMPLATE = BASE_DIR / "Etat_HSUP_Vacataire_2026_2027.xlsx"
+FICHIER_TEMPLATE = BASE_DIR / "Etat_HSUP_Enseignant_2026_2027.xlsx"
 
 # Les blocs et lignes correspondent à la feuille « Nom & prénom » du modèle fourni.
 # Mois affichés dans la fiche : le tableau est reconstruit dynamiquement (une ligne par jour travaillé).
@@ -320,8 +332,10 @@ def charger_donnees():
         raise ValueError("Le fichier personnel doit contenir les colonnes NOM et Qualité.")
     df_pv["NOM"] = df_pv["NOM"].fillna("").astype(str).str.strip()
     df_pv["Qualité"] = df_pv["Qualité"].fillna("").astype(str).str.strip()
-    df_vac = df_pv[df_pv["Qualité"].str.casefold().eq("vacataire")].copy()
-    df_vac["NOM_NORM"] = df_vac["NOM"].apply(normaliser_nom)
+    df_enseignants = df_pv[
+        df_pv["Qualité"].str.casefold().str.contains(r"permanent|vacataire", na=False)
+    ].copy()
+    df_enseignants["NOM_NORM"] = df_enseignants["NOM"].apply(normaliser_nom)
 
     df_edt = pd.read_excel(FICHIER_EDT, sheet_name=0, dtype=str)
     df_edt.columns = [nettoyer_texte(c) for c in df_edt.columns]
@@ -384,13 +398,13 @@ def charger_donnees():
                     dict_arabe.setdefault(normaliser_nom(nom_pv), arabe_par_email[email])
 
     actifs = []
-    for _, vac in df_vac.iterrows():
-        nom_n = vac["NOM_NORM"]
+    for _, enseignant in df_enseignants.iterrows():
+        nom_n = enseignant["NOM_NORM"]
         if nom_n and df_edt["Enseignants"].apply(
             lambda x: correspond_enseignant(x, nom_n)
         ).any():
-            actifs.append(vac["NOM"])
-    return df_vac, df_edt, dict_arabe, sorted(set(actifs))
+            actifs.append(enseignant["NOM"])
+    return df_enseignants, df_edt, dict_arabe, sorted(set(actifs))
 
 
 def dates_du_mois(annee, mois):
@@ -449,11 +463,11 @@ def format_heures_arabe(valeur):
     return None
 
 
-def remplir_fiche(ws, nom_vacataire, seances, dict_arabe, date_debut,
-                  date_fin, exclusions_par_mois):
+def remplir_fiche(ws, nom_enseignant, seances, dict_arabe, date_debut,
+                  date_fin, exclusions_par_mois, qualite_enseignant=""):
     """Remplit une feuille du modèle officiel pour un seul enseignant."""
-    nom_norm = normaliser_nom(nom_vacataire)
-    identite_arabe = identite_arabe_de(dict_arabe, nom_vacataire)
+    nom_norm = normaliser_nom(nom_enseignant)
+    identite_arabe = identite_arabe_de(dict_arabe, nom_enseignant)
     ism_ar = nettoyer_texte(identite_arabe.get("ism", "")) if isinstance(identite_arabe, dict) else ""
     laqab_ar = nettoyer_texte(identite_arabe.get("laqab", "")) if isinstance(identite_arabe, dict) else ""
 
@@ -461,7 +475,10 @@ def remplir_fiche(ws, nom_vacataire, seances, dict_arabe, date_debut,
     # automatique qui pourrait inverser ou tronquer les noms composés.
     ws["A7"] = f"الاسم : {ism_ar}" if ism_ar else "الاسم :"
     ws["C7"] = f"اللقب : {laqab_ar}" if laqab_ar else "اللقب :"
-    ws["A8"] = "الرتبة :أستاذ مؤقت"
+    ws["A8"] = "الرتبة :" + (
+        "أستاذ دائم" if "permanent" in nettoyer_texte(qualite_enseignant).casefold()
+        else "أستاذ مؤقت"
+    )
     ws["C8"] = "الهيئة المستخدمة الأصلية : الالكتروتقني"
 
     matieres = sorted({
@@ -618,7 +635,8 @@ def remplir_fiche(ws, nom_vacataire, seances, dict_arabe, date_debut,
     return total_general, details, heures_par_mois
 
 
-def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, date_fin, exclusions_par_mois):
+def generer_excel(nom_enseignant, seances, dict_arabe, date_debut, date_fin,
+                  exclusions_par_mois, qualite_enseignant=""):
     """Génère la fiche individuelle selon le modèle officiel."""
     wb = openpyxl.load_workbook(FICHIER_TEMPLATE)
     nom_feuille = "Nom & prénom" if "Nom & prénom" in wb.sheetnames else wb.sheetnames[0]
@@ -630,9 +648,10 @@ def generer_excel(nom_vacataire, seances, dict_arabe, date_debut, date_fin, excl
             del wb[autre_feuille]
 
     total_general, details, _ = remplir_fiche(
-        ws, nom_vacataire, seances, dict_arabe, date_debut, date_fin, exclusions_par_mois
+        ws, nom_enseignant, seances, dict_arabe, date_debut, date_fin,
+        exclusions_par_mois, qualite_enseignant
     )
-    ws.title = re.sub(r"[\\\\/*?:\\[\\]]", " ", nom_vacataire).strip()[:31] or "Etat H.SUP"
+    ws.title = re.sub(r"[\\\\/*?:\\[\\]]", " ", nom_enseignant).strip()[:31] or "Etat H.SUP"
 
     wd = wb.create_sheet("Détail calcul")
     wd.append(["Mois", "Jour", "Date", "Séances", "Heures calculées"])
@@ -676,7 +695,7 @@ def nom_onglet_unique(nom, deja_utilises):
     return candidat
 
 
-def generer_excel_groupe(df_vacataires, df_edt, liste_enseignants, dict_arabe,
+def generer_excel_groupe(df_enseignants, df_edt, liste_enseignants, dict_arabe,
                          date_debut, date_fin, exclusions_par_mois):
     """
     Crée un seul classeur : index cliquable, récapitulatif, puis une fiche
@@ -757,8 +776,14 @@ def generer_excel_groupe(df_vacataires, df_edt, liste_enseignants, dict_arabe,
     # Les feuilles d'index et de récap sont créées avant les fiches : déplacer
     # explicitement l'ordre pour garantir Index, Récapitulatif, puis fiches.
     for nom, seances, ws_fiche in fiches:
+        ligne_personnel = df_enseignants[df_enseignants["NOM_NORM"].eq(normaliser_nom(nom))]
+        qualite_fiche = (
+            nettoyer_texte(ligne_personnel.iloc[0].get("Qualité", ""))
+            if not ligne_personnel.empty else ""
+        )
         total, details, heures_mois = remplir_fiche(
-            ws_fiche, nom, seances, dict_arabe, date_debut, date_fin, exclusions_par_mois
+            ws_fiche, nom, seances, dict_arabe, date_debut, date_fin,
+            exclusions_par_mois, qualite_fiche
         )
         identite_arabe = identite_arabe_de(dict_arabe, nom)
         nom_arabe = (identite_arabe.get("complet", "")
@@ -1439,21 +1464,203 @@ def generer_zip_edt(liste_edt):
     return buffer
 
 
+
+def _supabase_config():
+    """Lit les paramètres d'authentification dans les Secrets Streamlit."""
+    try:
+        url = str(st.secrets.get("SUPABASE_URL", "")).strip().rstrip("/")
+        key = str(
+            st.secrets.get("SUPABASE_ANON_KEY", "")
+            or st.secrets.get("SUPABASE_KEY", "")
+        ).strip()
+        admins = str(st.secrets.get("HSUP_ADMIN_EMAILS", "")).strip()
+    except Exception:
+        url, key, admins = "", "", ""
+    return url, key, {x.strip().casefold() for x in admins.split(",") if x.strip()}
+
+
+def _supabase_requete(url, anon_key, chemin, donnees, access_token=None):
+    """Appel REST Supabase sans dépendance supplémentaire."""
+    corps = json.dumps(donnees, ensure_ascii=False).encode("utf-8")
+    headers = {"apikey": anon_key, "Content-Type": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    req = urllib.request.Request(
+        f"{url}/auth/v1/{chemin.lstrip('/')}",
+        data=corps, headers=headers, method="POST" if chemin != "user" else "PUT"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8")), None
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8"))
+            message = detail.get("msg") or detail.get("message") or detail.get("error_description") or str(detail)
+        except Exception:
+            message = str(exc)
+        return None, message
+    except Exception as exc:
+        return None, str(exc)
+
+
+def authentifier_enseignant(liste_enseignants):
+    """Inscription/connexion. L'identité française est liée au référentiel EDT."""
+    url, anon_key, admins = _supabase_config()
+    if not url or not anon_key:
+        st.error(
+            "L'inscription sécurisée n'est pas encore activée. "
+            "Configure SUPABASE_URL et SUPABASE_ANON_KEY dans les Secrets Streamlit."
+        )
+        st.info(
+            "La création de comptes nécessite un service d'authentification persistant. "
+            "Les comptes ne doivent pas être enregistrés dans un fichier local de l'application."
+        )
+        st.stop()
+
+    if st.session_state.get("hsup_access_token"):
+        profil = st.session_state.get("hsup_user", {})
+        email = str(profil.get("email", "")).casefold()
+        nom = nettoyer_texte((profil.get("user_metadata") or {}).get("nom_enseignant", ""))
+        if nom not in liste_enseignants:
+            st.error("Le compte connecté n'est pas associé à un enseignant actif du fichier personnel/EDT.")
+            if st.button("Se déconnecter", key="hsup_logout_invalid"):
+                st.session_state.pop("hsup_access_token", None)
+                st.session_state.pop("hsup_user", None)
+                st.rerun()
+            st.stop()
+        st.sidebar.success(f"Compte connecté : {email}")
+        if st.sidebar.button("Déconnexion", key="hsup_logout"):
+            st.session_state.pop("hsup_access_token", None)
+            st.session_state.pop("hsup_user", None)
+            st.rerun()
+        return nom, email in admins, profil
+
+    st.subheader("🔐 Espace enseignant — Connexion et inscription")
+    tab_connexion, tab_inscription = st.tabs(["Se connecter", "Créer mon compte"])
+    with tab_connexion:
+        with st.form("hsup_form_connexion"):
+            email_login = st.text_input("Adresse e-mail", key="hsup_email_login")
+            mdp_login = st.text_input("Mot de passe", type="password", key="hsup_mdp_login")
+            envoyer_login = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
+        if envoyer_login:
+            if not email_login.strip() or not mdp_login:
+                st.error("Saisissez votre adresse e-mail et votre mot de passe.")
+            else:
+                resultat, erreur = _supabase_requete(
+                    url, anon_key, "token?grant_type=password",
+                    {"email": email_login.strip(), "password": mdp_login}
+                )
+                if erreur:
+                    st.error(f"Connexion impossible : {erreur}")
+                elif resultat and resultat.get("access_token"):
+                    st.session_state["hsup_access_token"] = resultat["access_token"]
+                    st.session_state["hsup_user"] = resultat.get("user", {})
+                    st.rerun()
+
+    with tab_inscription:
+        with st.form("hsup_form_inscription"):
+            nom_inscription = st.selectbox(
+                "Choisir votre nom dans le fichier du personnel",
+                options=liste_enseignants,
+                key="hsup_nom_inscription"
+            )
+            email_inscription = st.text_input("Adresse e-mail professionnelle ou personnelle")
+            mdp_inscription = st.text_input("Créer un mot de passe", type="password")
+            mdp_confirmation = st.text_input("Confirmer le mot de passe", type="password")
+            ism_inscription = st.text_input("الاسم (prénom en arabe) — facultatif")
+            laqab_inscription = st.text_input("اللقب (nom en arabe) — facultatif")
+            envoyer_inscription = st.form_submit_button(
+                "Créer mon compte", type="primary", use_container_width=True
+            )
+        if envoyer_inscription:
+            if not email_inscription.strip() or len(mdp_inscription) < 8:
+                st.error("Indiquez un e-mail valide et un mot de passe d'au moins 8 caractères.")
+            elif mdp_inscription != mdp_confirmation:
+                st.error("Les deux mots de passe ne sont pas identiques.")
+            else:
+                metadata = {
+                    "nom_enseignant": nom_inscription,
+                    "ism_arabe": ism_inscription.strip(),
+                    "laqab_arabe": laqab_inscription.strip(),
+                    "role": "enseignant"
+                }
+                resultat, erreur = _supabase_requete(
+                    url, anon_key, "signup",
+                    {"email": email_inscription.strip(), "password": mdp_inscription, "data": metadata}
+                )
+                if erreur:
+                    st.error(f"Inscription impossible : {erreur}")
+                elif resultat and resultat.get("access_token"):
+                    st.session_state["hsup_access_token"] = resultat["access_token"]
+                    st.session_state["hsup_user"] = resultat.get("user", {})
+                    st.success("Compte créé et connecté.")
+                    st.rerun()
+                else:
+                    st.success(
+                        "Demande de création envoyée. Consultez votre boîte e-mail pour confirmer "
+                        "l'adresse, puis connectez-vous."
+                    )
+    st.stop()
+
+
+def mettre_a_jour_metadonnees_compte(donnees):
+    """Enregistre les préférences personnelles dans les métadonnées du compte Supabase."""
+    url, anon_key, _ = _supabase_config()
+    token = st.session_state.get("hsup_access_token")
+    if not token:
+        return False, "Aucun compte connecté."
+    profil, erreur = _supabase_requete(
+        url, anon_key, "user", {"data": donnees}, access_token=token
+    )
+    if erreur:
+        return False, erreur
+    if profil:
+        st.session_state["hsup_user"] = profil
+    return True, ""
+
+
+def enregistrer_identite_arabe_compte(ism, laqab):
+    """Enregistre les champs arabes dans les métadonnées du compte authentifié."""
+    return mettre_a_jour_metadonnees_compte({"ism_arabe": ism, "laqab_arabe": laqab})
+
+
+def lire_date_compte(valeur, defaut):
+    """Convertit une date ISO stockée dans le compte, avec une valeur de repli sûre."""
+    try:
+        return date.fromisoformat(str(valeur)) if valeur else defaut
+    except (TypeError, ValueError):
+        return defaut
+
 try:
-    df_vacataires, df_edt, dict_noms_arabe, liste_vacataires_actifs = charger_donnees()
+    df_enseignants, df_edt, dict_noms_arabe, liste_enseignants_actifs = charger_donnees()
+    enseignant_connecte, est_administrateur, profil_compte = authentifier_enseignant(
+        liste_enseignants_actifs
+    )
+    enseignant_select = enseignant_connecte
 
     st.sidebar.header("🔍 Paramètres & calendrier")
+    metadata_compte_cal = profil_compte.get("user_metadata") or {}
+    date_debut_defaut = lire_date_compte(
+        metadata_compte_cal.get("hsup_date_debut"), date(2026, 9, 23)
+    )
+    date_fin_defaut = lire_date_compte(
+        metadata_compte_cal.get("hsup_date_fin"), date(2026, 12, 17)
+    )
     date_debut_cours = st.sidebar.date_input(
         "Date de début de comptabilisation des H.SUP",
-        value=date(2026, 9, 23),
+        value=date_debut_defaut,
         min_value=date(2026, 1, 1),
         max_value=date(2026, 12, 31),
+        format="DD/MM/YYYY",
+        key="hsup_date_debut_widget",
     )
     date_fin_comptabilisation = st.sidebar.date_input(
         "Date de fin de comptabilisation des H.SUP",
-        value=date(2026, 12, 17),
+        value=date_fin_defaut,
         min_value=date(2026, 1, 1),
         max_value=date(2026, 12, 31),
+        format="DD/MM/YYYY",
+        key="hsup_date_fin_widget",
     )
     if date_debut_cours > date_fin_comptabilisation:
         st.sidebar.error("La date de début doit être antérieure ou égale à la date de fin.")
@@ -1467,16 +1674,17 @@ try:
         "Nom sous « نائبي رئيس القسم »", value=SIGNATAIRES["naib_chef"], key="signataire_naib_chef")
     SIGNATAIRES["chef"] = st.sidebar.text_input(
         "Nom sous « رئيس القسم »", value=SIGNATAIRES["chef"], key="signataire_chef")
-    vacataire_select = st.sidebar.selectbox(
-        "Choisir un enseignant vacataire", liste_vacataires_actifs
-    ) if liste_vacataires_actifs else None
+    st.sidebar.text_input(
+        "Enseignant connecté", value=enseignant_select, disabled=True,
+        help="Votre compte est lié à votre identité dans le fichier du personnel."
+    )
 
-    if not vacataire_select:
-        st.error("Aucun enseignant vacataire avec une charge horaire n'a été trouvé dans l'EDT.")
+    if not enseignant_select:
+        st.error("Aucun enseignant permanent ou vacataire avec une charge horaire n'a été trouvé dans l'EDT.")
         st.stop()
 
-    nom_norm = normaliser_nom(vacataire_select)
-    seances_vac = df_edt[
+    nom_norm = normaliser_nom(enseignant_select)
+    seances_enseignant = df_edt[
         df_edt["Enseignants"].apply(lambda x: correspond_enseignant(x, nom_norm))
     ].copy()
 
@@ -1489,6 +1697,7 @@ try:
         "Sélectionne ci-dessous toute autre date sans enseignement à comptabiliser."
     )
     exclusions_par_mois = {}
+    exclusions_sauvees = metadata_compte_cal.get("hsup_dates_exclues", {}) or {}
     colonnes = st.columns(len(MOIS_BLOCKS))
     for col, bloc in zip(colonnes, MOIS_BLOCKS):
         with col:
@@ -1499,34 +1708,87 @@ try:
                 if date.fromisoformat(cle) >= date_debut_cours
                 and date.fromisoformat(cle) <= date_fin_comptabilisation
             ]
+            cle_widget = f"exclusions_{bloc['annee']}_{bloc['mois']}"
+            deja_exclues = exclusions_sauvees.get(str(bloc["mois"]), [])
+            deja_exclues = [x for x in deja_exclues if x in dates_dans_periode]
+            selection_actuelle = st.session_state.get(cle_widget, deja_exclues)
+            st.session_state[cle_widget] = [x for x in selection_actuelle if x in dates_dans_periode]
             choix = st.multiselect(
                 f"Dates à exclure – {bloc['nom']}",
                 options=dates_dans_periode,
                 format_func=lambda x, d=labels: d[x],
-                default=[],
-                key=f"exclusions_{bloc['annee']}_{bloc['mois']}",
+                key=cle_widget,
             )
             exclusions_par_mois[bloc["mois"]] = {
                 date.fromisoformat(x) for x in choix
             }
 
+    if st.button("💾 Enregistrer ma période et mes jours à exclure", use_container_width=True,
+                 key="hsup_save_calendar"):
+        exclusions_a_sauver = {
+            str(mois): sorted(d.isoformat() for d in dates)
+            for mois, dates in exclusions_par_mois.items()
+        }
+        ok_cal, erreur_cal = mettre_a_jour_metadonnees_compte({
+            "hsup_date_debut": date_debut_cours.isoformat(),
+            "hsup_date_fin": date_fin_comptabilisation.isoformat(),
+            "hsup_dates_exclues": exclusions_a_sauver,
+        })
+        if ok_cal:
+            st.success("Votre période H.SUP et vos jours à exclure ont été enregistrés dans votre compte.")
+            st.rerun()
+        else:
+            st.error(f"Impossible d'enregistrer vos paramètres : {erreur_cal}")
+
     st.divider()
-    st.subheader(f"👨‍🏫 Fiche enseignant : {vacataire_select}")
-    identite_arabe, mode_arabe, cle_arabe = trouver_identite_arabe(dict_noms_arabe, vacataire_select)
-    nom_arabe = (identite_arabe.get("complet", "")
-                 if isinstance(identite_arabe, dict) else nettoyer_texte(identite_arabe))
+    st.subheader(f"👨‍🏫 Fiche enseignant : {enseignant_select}")
+    identite_arabe, mode_arabe, cle_arabe = trouver_identite_arabe(dict_noms_arabe, enseignant_select)
+    metadata_compte = profil_compte.get("user_metadata") or {}
+    ism_arabe = nettoyer_texte(metadata_compte.get("ism_arabe", "")) or nettoyer_texte(
+        identite_arabe.get("ism", "") if isinstance(identite_arabe, dict) else ""
+    )
+    laqab_arabe = nettoyer_texte(metadata_compte.get("laqab_arabe", "")) or nettoyer_texte(
+        identite_arabe.get("laqab", "") if isinstance(identite_arabe, dict) else ""
+    )
+    nom_arabe = " ".join(x for x in (ism_arabe, laqab_arabe) if x)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Nom en arabe", nom_arabe or "Non renseigné")
-    ligne_pv = df_vacataires[df_vacataires["NOM_NORM"].eq(nom_norm)].iloc[0]
-    c2.metric("Grade", nettoyer_texte(ligne_pv.get("Grade", "")) or "Vacataire")
-    c3.metric("Séances EDT", len(seances_vac))
-    c4.metric("Volume hebdomadaire EDT", f"{seances_vac['DUREE_H'].sum():g} h")
+    ligne_pv = df_enseignants[df_enseignants["NOM_NORM"].eq(nom_norm)].iloc[0]
+    c2.metric(
+        "Qualité / Grade",
+        " — ".join(x for x in (
+            nettoyer_texte(ligne_pv.get("Qualité", "")),
+            nettoyer_texte(ligne_pv.get("Grade", ""))
+        ) if x) or "Non renseigné"
+    )
+    c3.metric("Séances EDT", len(seances_enseignant))
+    c4.metric("Volume hebdomadaire EDT", f"{seances_enseignant['DUREE_H'].sum():g} h")
     if not nom_arabe:
         st.warning(
-            "Aucune correspondance arabe trouvée pour ce nom français. "
-            "Vérifie l'orthographe dans « Nom et prénom en francais » du formulaire."
+            "Le fichier source ne contient pas encore le nom et le prénom en arabe. "
+            "Renseignez-les ci-dessous pour compléter votre fiche H.SUP."
         )
-    elif mode_arabe != "exacte":
+    with st.form("hsup_identite_arabe_form"):
+        col_ism, col_laqab = st.columns(2)
+        ism_saisi = col_ism.text_input("الاسم — prénom en arabe", value=ism_arabe)
+        laqab_saisi = col_laqab.text_input("اللقب — nom en arabe", value=laqab_arabe)
+        sauvegarder_arabe = st.form_submit_button("Enregistrer mes renseignements en arabe")
+    if sauvegarder_arabe:
+        ok, erreur = enregistrer_identite_arabe_compte(ism_saisi.strip(), laqab_saisi.strip())
+        if ok:
+            st.success("Vos renseignements en arabe ont été enregistrés dans votre compte.")
+            st.rerun()
+        else:
+            st.error(f"Enregistrement impossible : {erreur}")
+    dict_noms_arabe[normaliser_nom(enseignant_select)] = {
+        "ism": ism_saisi.strip() if 'ism_saisi' in locals() else ism_arabe,
+        "laqab": laqab_saisi.strip() if 'laqab_saisi' in locals() else laqab_arabe,
+        "complet": " ".join(x for x in (
+            ism_saisi.strip() if 'ism_saisi' in locals() else ism_arabe,
+            laqab_saisi.strip() if 'laqab_saisi' in locals() else laqab_arabe
+        ) if x)
+    }
+    if mode_arabe != "exacte" and nom_arabe:
         libelles_mode = {
             "ordre": "mêmes mots dans un autre ordre",
             "orthographe": "orthographe légèrement différente (lettres doublées)",
@@ -1534,20 +1796,20 @@ try:
             "partielle": "nom incomplet d'un côté",
         }
         st.info(
-            f"Correspondance du formulaire arabe : « {vacataire_select} » ↔ « {cle_arabe} » "
+            f"Correspondance du formulaire arabe : « {enseignant_select} » ↔ « {cle_arabe} » "
             f"({libelles_mode.get(mode_arabe, mode_arabe)}). Vérifiez que c'est bien le même enseignant."
         )
 
     colonnes_aff = [
         c for c in ["Enseignements", "Code", "Horaire", "Jours", "Lieu", "Promotion"]
-        if c in seances_vac.columns
+        if c in seances_enseignant.columns
     ]
     st.markdown("### Séances hebdomadaires issues de l'EDT")
-    st.dataframe(seances_vac[colonnes_aff], use_container_width=True, hide_index=True)
+    st.dataframe(seances_enseignant[colonnes_aff], use_container_width=True, hide_index=True)
 
     # ---- Emploi du temps individuel en grille (PDF, dimensions du modèle PPER.03) ----
     st.markdown("### 🗓️ Emploi du temps individuel (grille PDF)")
-    qualite_select = nettoyer_texte(ligne_pv.get("Qualité", "")) or "Vacataire"
+    qualite_select = nettoyer_texte(ligne_pv.get("Qualité", "")) or "Enseignant"
     if trouver_logo() is None:
         st.info(
             "logo.PNG introuvable à côté de app.py : le logo intégré de l'université est utilisé. "
@@ -1555,27 +1817,28 @@ try:
         )
     st.download_button(
         label="📥 Télécharger l'emploi du temps individuel (PDF)",
-        data=generer_pdf_edt([(vacataire_select, qualite_select, seances_vac)]),
-        file_name=nom_fichier_edt(vacataire_select),
+        data=generer_pdf_edt([(enseignant_select, qualite_select, seances_enseignant)]),
+        file_name=nom_fichier_edt(enseignant_select),
         mime="application/pdf",
         use_container_width=True,
         key="download_edt_individuel",
     )
 
-    erreurs_horaires = seances_vac[
-        seances_vac["DUREE_H"].isna()
-    ] if "DUREE_H" in seances_vac.columns else pd.DataFrame()
+    erreurs_horaires = seances_enseignant[
+        seances_enseignant["DUREE_H"].isna()
+    ] if "DUREE_H" in seances_enseignant.columns else pd.DataFrame()
     if not erreurs_horaires.empty:
         st.error("Certaines séances ont un horaire non interprétable. Corrige la source EDT.")
 
     if st.button("🚀 Générer l'état Excel officiel actualisé", type="primary",
                  use_container_width=True):
         buffer, total_general, details = generer_excel(
-            vacataire_select, seances_vac, dict_noms_arabe,
-            date_debut_cours, date_fin_comptabilisation, exclusions_par_mois
+            enseignant_select, seances_enseignant, dict_noms_arabe,
+            date_debut_cours, date_fin_comptabilisation, exclusions_par_mois,
+            qualite_select
         )
-        nom_fichier_clean = normaliser_nom(vacataire_select).replace(" ", "_")
-        file_name = f"Etat_HSUP_Vacataire_{nom_fichier_clean}_2026_2027.xlsx"
+        nom_fichier_clean = normaliser_nom(enseignant_select).replace(" ", "_")
+        file_name = f"Etat_HSUP_Enseignant_{nom_fichier_clean}_2026_2027.xlsx"
         st.success(
             f"État Excel généré. Total calculé sur les dates admissibles : "
             f"{format_heures_arabe(total_general) or '0سا'}."
@@ -1590,91 +1853,91 @@ try:
         st.markdown("#### Vérification du calcul jour par jour")
         st.dataframe(pd.DataFrame(details), use_container_width=True, hide_index=True)
 
-    st.divider()
-    st.subheader("📚 Téléchargement groupé – Tous les enseignants vacataires")
-    st.markdown(
-        "Un seul classeur Excel multifeuille contenant un index cliquable, "
-        "un récapitulatif des charges Cours/TD/TP et une fiche officielle par enseignant."
-    )
-    # ---- Emplois du temps PDF : un ou plusieurs enseignants, même ordre que l'Excel groupé ----
-    st.markdown("#### 🗓️ Emplois du temps PDF (un ou plusieurs enseignants)")
-    st.caption(
-        "L'ordre est identique à celui du classeur Excel groupé : l'ordre alphabétique de la liste "
-        "« Choisir un enseignant vacataire »."
-    )
-    tous_edt = st.checkbox("Sélectionner tous les enseignants", key="edt_pdf_tous")
-    choix_edt = st.multiselect(
-        "Enseignants à inclure", options=liste_vacataires_actifs,
-        default=[vacataire_select], disabled=tous_edt, key="edt_pdf_choix",
-    )
-    format_edt = st.radio(
-        "Format du téléchargement",
-        ["Un seul PDF (une page par enseignant)", "Un PDF par enseignant (fichier ZIP)"],
-        horizontal=True, key="edt_pdf_format",
-    )
-    choisis = set(liste_vacataires_actifs) if tous_edt else set(choix_edt)
-    # On parcourt la liste de référence : l'ordre est donc celui de l'Excel, quel que soit l'ordre de clic.
-    selection_edt = [n for n in liste_vacataires_actifs if n in choisis]
-    st.caption(f"{len(selection_edt)} enseignant(s) sélectionné(s).")
-    if st.button("🗓️ Préparer le téléchargement des emplois du temps",
-                 use_container_width=True, disabled=not selection_edt, key="edt_pdf_preparer"):
-        with st.spinner("Génération des grilles d'emploi du temps..."):
-            liste_edt = []
-            for nom_edt in selection_edt:
-                n_norm = normaliser_nom(nom_edt)
-                seances_edt = df_edt[
-                    df_edt["Enseignants"].apply(lambda x: correspond_enseignant(x, n_norm))
-                ].copy()
-                if seances_edt.empty:
-                    continue
-                ligne_edt = df_vacataires[df_vacataires["NOM_NORM"].eq(n_norm)]
-                qualite_edt = (nettoyer_texte(ligne_edt.iloc[0].get("Qualité", ""))
-                               if not ligne_edt.empty else "") or "Vacataire"
-                liste_edt.append((nom_edt, qualite_edt, seances_edt))
-            if not liste_edt:
-                st.session_state.pop("edt_pdf_pret", None)
-                st.warning("Aucune séance EDT pour la sélection.")
-            elif format_edt.startswith("Un PDF par"):
-                st.session_state["edt_pdf_pret"] = {
-                    "data": generer_zip_edt(liste_edt).getvalue(),
-                    "nom": "EDT_Enseignants_ELT_2027.zip", "mime": "application/zip",
-                    "ordre": [e[0] for e in liste_edt],
-                }
-            else:
-                st.session_state["edt_pdf_pret"] = {
-                    "data": generer_pdf_edt(liste_edt).getvalue(),
-                    "nom": (nom_fichier_edt(liste_edt[0][0]) if len(liste_edt) == 1
-                            else "EDT_Enseignants_ELT_2027.pdf"),
-                    "mime": "application/pdf",
-                    "ordre": [e[0] for e in liste_edt],
-                }
-    pret = st.session_state.get("edt_pdf_pret")
-    if pret:
-        st.success(f"{len(pret['ordre'])} emploi(s) du temps prêt(s) : " + " → ".join(pret["ordre"][:8])
-                   + (" …" if len(pret["ordre"]) > 8 else ""))
-        st.download_button(
-            label=f"📥 Télécharger ({pret['nom']})",
-            data=pret["data"], file_name=pret["nom"], mime=pret["mime"],
-            use_container_width=True, key="download_edt_selection",
+    if est_administrateur:
+        st.divider()
+        st.subheader("📚 Administration — Téléchargement groupé de tous les enseignants")
+        st.markdown(
+            "Un seul classeur Excel multifeuille contenant un index cliquable, "
+            "un récapitulatif des charges Cours/TD/TP et une fiche officielle par enseignant."
         )
-
-    if st.button("📦 Générer le classeur Excel de tous les enseignants",
-                 type="primary", use_container_width=True):
-        with st.spinner("Génération des fiches de tous les enseignants..."):
-            buffer_groupe, nb_fiches = generer_excel_groupe(
-                df_vacataires, df_edt, liste_vacataires_actifs, dict_noms_arabe,
-                date_debut_cours, date_fin_comptabilisation, exclusions_par_mois
+        # ---- Emplois du temps PDF : un ou plusieurs enseignants, même ordre que l'Excel groupé ----
+        st.markdown("#### 🗓️ Emplois du temps PDF (un ou plusieurs enseignants)")
+        st.caption(
+            "L'ordre est identique à celui du classeur Excel groupé : l'ordre alphabétique de la liste "
+            "« Choisir un enseignant permanent ou vacataire »."
+        )
+        tous_edt = st.checkbox("Sélectionner tous les enseignants", key="edt_pdf_tous")
+        choix_edt = st.multiselect(
+            "Enseignants à inclure", options=liste_enseignants_actifs,
+            default=[enseignant_select], disabled=tous_edt, key="edt_pdf_choix",
+        )
+        format_edt = st.radio(
+            "Format du téléchargement",
+            ["Un seul PDF (une page par enseignant)", "Un PDF par enseignant (fichier ZIP)"],
+            horizontal=True, key="edt_pdf_format",
+        )
+        choisis = set(liste_enseignants_actifs) if tous_edt else set(choix_edt)
+        # On parcourt la liste de référence : l'ordre est donc celui de l'Excel, quel que soit l'ordre de clic.
+        selection_edt = [n for n in liste_enseignants_actifs if n in choisis]
+        st.caption(f"{len(selection_edt)} enseignant(s) sélectionné(s).")
+        if st.button("🗓️ Préparer le téléchargement des emplois du temps",
+                     use_container_width=True, disabled=not selection_edt, key="edt_pdf_preparer"):
+            with st.spinner("Génération des grilles d'emploi du temps..."):
+                liste_edt = []
+                for nom_edt in selection_edt:
+                    n_norm = normaliser_nom(nom_edt)
+                    seances_edt = df_edt[
+                        df_edt["Enseignants"].apply(lambda x: correspond_enseignant(x, n_norm))
+                    ].copy()
+                    if seances_edt.empty:
+                        continue
+                    ligne_edt = df_enseignants[df_enseignants["NOM_NORM"].eq(n_norm)]
+                    qualite_edt = (nettoyer_texte(ligne_edt.iloc[0].get("Qualité", ""))
+                                   if not ligne_edt.empty else "") or "Enseignant"
+                    liste_edt.append((nom_edt, qualite_edt, seances_edt))
+                if not liste_edt:
+                    st.session_state.pop("edt_pdf_pret", None)
+                    st.warning("Aucune séance EDT pour la sélection.")
+                elif format_edt.startswith("Un PDF par"):
+                    st.session_state["edt_pdf_pret"] = {
+                        "data": generer_zip_edt(liste_edt).getvalue(),
+                        "nom": "EDT_Tous_Enseignants_ELT_2027.zip", "mime": "application/zip",
+                        "ordre": [e[0] for e in liste_edt],
+                    }
+                else:
+                    st.session_state["edt_pdf_pret"] = {
+                        "data": generer_pdf_edt(liste_edt).getvalue(),
+                        "nom": (nom_fichier_edt(liste_edt[0][0]) if len(liste_edt) == 1
+                                else "EDT_Tous_Enseignants_ELT_2027.pdf"),
+                        "mime": "application/pdf",
+                        "ordre": [e[0] for e in liste_edt],
+                    }
+        pret = st.session_state.get("edt_pdf_pret")
+        if pret:
+            st.success(f"{len(pret['ordre'])} emploi(s) du temps prêt(s) : " + " → ".join(pret["ordre"][:8])
+                       + (" …" if len(pret["ordre"]) > 8 else ""))
+            st.download_button(
+                label=f"📥 Télécharger ({pret['nom']})",
+                data=pret["data"], file_name=pret["nom"], mime=pret["mime"],
+                use_container_width=True, key="download_edt_selection",
             )
-        st.success(f"Classeur groupé généré : {nb_fiches} fiches individuelles.")
-        st.download_button(
-            label="📥 Télécharger toutes les fiches H.SUP (Excel multifeuille)",
-            data=buffer_groupe,
-            file_name="Etats_HSUP_Tous_Vacataires_ELT_2026_2027.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="download_hsup_groupe",
-        )
 
+        if st.button("📦 Générer le classeur Excel de tous les enseignants",
+                     type="primary", use_container_width=True):
+            with st.spinner("Génération des fiches de tous les enseignants..."):
+                buffer_groupe, nb_fiches = generer_excel_groupe(
+                    df_enseignants, df_edt, liste_enseignants_actifs, dict_noms_arabe,
+                    date_debut_cours, date_fin_comptabilisation, exclusions_par_mois
+                )
+            st.success(f"Classeur groupé généré : {nb_fiches} fiches individuelles.")
+            st.download_button(
+                label="📥 Télécharger toutes les fiches H.SUP (Excel multifeuille)",
+                data=buffer_groupe,
+                file_name="Etats_HSUP_Tous_Enseignants_ELT_2026_2027.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="download_hsup_groupe",
+            )
 except Exception as e:
     st.error(f"Une erreur est survenue lors du traitement : {e}")
     st.exception(e)

@@ -412,12 +412,7 @@ def charger_donnees():
 
 
 def charger_edt_complet():
-    """Charge l'EDT complet, sans filtrer par département.
-
-    Cette version conserve toutes les charges d'un enseignant, y compris celles
-    assurées dans d'autres départements, afin de pouvoir les afficher dans
-    l'emploi du temps individuel par département et par promotion.
-    """
+    """Charge l'EDT complet, sans filtrer par département."""
     df_edt_complet = pd.read_excel(FICHIER_EDT, sheet_name=0, dtype=str)
     df_edt_complet.columns = [nettoyer_texte(c) for c in df_edt_complet.columns]
 
@@ -1486,12 +1481,7 @@ def _edt_creneau(horaire):
 
 
 def _edt_lignes_case(seances_case, largeur_utile):
-    """Lignes de texte d'une case : département, enseignement, lieu et promotion(s).
-
-    Les séances identiques (même département, même enseignement, même lieu)
-    données à plusieurs promotions au même créneau sont regroupées :
-    « M1CE, M1ER, M1ME ».
-    """
+    """Lignes de texte d'une case : département, enseignement, lieu et promotion(s)."""
     from reportlab.lib.utils import simpleSplit
     groupes = {}
     for _, seance in seances_case:
@@ -1744,7 +1734,16 @@ def _supabase_table_requete(table, methode="GET", donnees=None, params="", admin
         return None, str(exc)
 
 
-def sauvegarder_preferences_hsup(user_id, nom_enseignant, selections=None, exclu=None):
+def sauvegarder_preferences_hsup(
+    user_id,
+    nom_enseignant,
+    selections=None,
+    exclu=None,
+    email=None,
+    telephone=None,
+    ism_arabe=None,
+    laqab_arabe=None,
+):
     """Crée ou met à jour la préférence H.SUP du compte enseignant."""
     if not user_id:
         return False, "Identifiant utilisateur Supabase absent."
@@ -1752,6 +1751,14 @@ def sauvegarder_preferences_hsup(user_id, nom_enseignant, selections=None, exclu
              "selected_teachings": list(selections or [])}
     if exclu is not None:
         ligne["excluded"] = bool(exclu)
+    if email is not None:
+        ligne["email"] = nettoyer_texte(email)
+    if telephone is not None:
+        ligne["telephone"] = nettoyer_texte(telephone)
+    if ism_arabe is not None:
+        ligne["ism_arabe"] = nettoyer_texte(ism_arabe)
+    if laqab_arabe is not None:
+        ligne["laqab_arabe"] = nettoyer_texte(laqab_arabe)
     resultat, erreur = _supabase_table_requete(
         "hsup_preferences", "POST", ligne, "on_conflict=user_id", admin=False
     )
@@ -1798,6 +1805,167 @@ def mettre_a_jour_exclusions_admin(noms_exclus, df_enseignants=None):
     return (erreur is None), (erreur or "")
 
 
+def charger_coordonnees_enseignants_admin():
+    """Charge les coordonnées saisies par les enseignants dans Supabase."""
+    resultat, erreur = _supabase_table_requete(
+        "hsup_preferences",
+        "GET",
+        params=(
+            "select=user_id,teacher_name,email,telephone,"
+            "ism_arabe,laqab_arabe&order=teacher_name.asc"
+        ),
+        admin=True,
+    )
+
+    coordonnees = {}
+    for ligne in resultat or []:
+        nom = normaliser_nom(ligne.get("teacher_name", ""))
+        if not nom:
+            continue
+        coordonnees[nom] = {
+            "email": nettoyer_texte(ligne.get("email", "")),
+            "telephone": nettoyer_texte(ligne.get("telephone", "")),
+            "nom_arabe": " ".join(
+                x for x in (
+                    nettoyer_texte(ligne.get("ism_arabe", "")),
+                    nettoyer_texte(ligne.get("laqab_arabe", "")),
+                ) if x
+            ),
+        }
+
+    return coordonnees, erreur
+
+
+def enregistrer_coordonnees_enseignant(
+    user_id,
+    nom_enseignant,
+    email,
+    telephone,
+    ism_arabe,
+    laqab_arabe,
+):
+    """Enregistre ou met à jour les coordonnées de l'enseignant dans Supabase."""
+    if not user_id:
+        return False, "Identifiant utilisateur Supabase absent."
+
+    ligne = {
+        "user_id": user_id,
+        "teacher_name": nom_enseignant,
+        "email": nettoyer_texte(email),
+        "telephone": nettoyer_texte(telephone),
+        "ism_arabe": nettoyer_texte(ism_arabe),
+        "laqab_arabe": nettoyer_texte(laqab_arabe),
+    }
+
+    _, erreur = _supabase_table_requete(
+        "hsup_preferences", "POST", ligne, "on_conflict=user_id", admin=False
+    )
+    return (erreur is None), (erreur or "")
+
+
+def construire_details_enseignants_historique(noms_enseignants, seances_par_enseignant=None):
+    """Construit les détails par enseignant pour l'historique des générations."""
+    seances_par_enseignant = seances_par_enseignant or {}
+    details = []
+
+    for nom in noms_enseignants:
+        nom = nettoyer_texte(nom)
+        nom_norm = normaliser_nom(nom)
+
+        ligne = df_enseignants[df_enseignants["NOM_NORM"].eq(nom_norm)]
+        qualite = (
+            nettoyer_texte(ligne.iloc[0].get("Qualité", ""))
+            if not ligne.empty
+            else ""
+        ) or "Enseignant"
+
+        coordonnees = coordonnees_enseignants.get(nom_norm, {})
+
+        nom_arabe = coordonnees.get("nom_arabe", "")
+        email = coordonnees.get("email", "")
+        telephone = coordonnees.get("telephone", "")
+
+        if not nom_arabe:
+            identite = identite_arabe_de(dict_noms_arabe, nom)
+            if isinstance(identite, dict):
+                ism = nettoyer_texte(identite.get("ism", ""))
+                laqab = nettoyer_texte(identite.get("laqab", ""))
+                nom_arabe = " ".join(x for x in (ism, laqab) if x)
+
+        if not email or not telephone:
+            if not ligne.empty:
+                ligne_dict = ligne.iloc[0].to_dict()
+                for colonne, valeur in ligne_dict.items():
+                    entete = normaliser_entete(colonne)
+                    valeur = nettoyer_texte(valeur)
+                    if not valeur:
+                        continue
+                    if not email and any(
+                        mot in entete for mot in ("email", "e mail", "adresse e mail")
+                    ):
+                        email = valeur
+                    if not telephone and any(
+                        mot in entete for mot in ("telephone", "téléphone", "phone", "mobile", "gsm")
+                    ):
+                        telephone = valeur
+
+        if (not email or not telephone) and FICHIER_COORD.exists():
+            try:
+                df_coord = pd.read_excel(FICHIER_COORD, dtype=str)
+                df_coord.columns = [nettoyer_texte(c) for c in df_coord.columns]
+
+                for _, ligne_coord in df_coord.iterrows():
+                    email_coord = ""
+                    telephone_coord = ""
+                    nom_coord = ""
+
+                    for colonne, valeur in ligne_coord.items():
+                        entete = normaliser_entete(colonne)
+                        valeur = nettoyer_texte(valeur)
+                        if not valeur:
+                            continue
+                        if any(mot in entete for mot in ("email", "e mail", "adresse e mail")):
+                            email_coord = valeur
+                        if any(mot in entete for mot in ("telephone", "téléphone", "phone", "mobile", "gsm")):
+                            telephone_coord = valeur
+                        if any(mot in entete for mot in ("nom et prenom", "nom complet", "nom prenom", "nom")):
+                            nom_coord = valeur
+
+                    correspondance = (
+                        (email and email_coord and email.casefold() == email_coord.casefold())
+                        or (nom_norm and nom_coord and normaliser_nom(nom_coord) == nom_norm)
+                    )
+
+                    if correspondance:
+                        email = email or email_coord
+                        telephone = telephone or telephone_coord
+                        break
+            except Exception:
+                pass
+
+        total_charge = ""
+        if nom_norm in seances_par_enseignant:
+            seances_enseignant = seances_par_enseignant[nom_norm]
+            if seances_enseignant is not None and not seances_enseignant.empty:
+                total_heures = float(
+                    pd.to_numeric(
+                        seances_enseignant["DUREE_H"], errors="coerce"
+                    ).fillna(0).sum()
+                )
+                total_charge = f"{total_heures:.2f} h"
+
+        details.append({
+            "nom": nom,
+            "qualite": qualite,
+            "nom_arabe": nom_arabe,
+            "email": email,
+            "telephone": telephone,
+            "total_charge": total_charge,
+        })
+
+    return details
+
+
 def enregistrer_historique_generation(
     generation_type,
     enseignants,
@@ -1806,6 +1974,7 @@ def enregistrer_historique_generation(
     statut="Succès",
     message="",
     total_hsup=None,
+    enseignants_details=None,
 ):
     """Enregistre une génération d'état H.SUP dans l'historique Supabase."""
     profil = st.session_state.get("hsup_user") or {}
@@ -1818,11 +1987,17 @@ def enregistrer_historique_generation(
             nettoyer_texte(x) for x in (enseignants or []) if nettoyer_texte(x)
         ]
 
+    if enseignants_details is None:
+        enseignants_details = construire_details_enseignants_historique(
+            liste_enseignants
+        )
+
     payload = {
         "generated_by": email_admin,
         "generation_type": nettoyer_texte(generation_type),
         "teachers": liste_enseignants,
         "teacher_count": len(liste_enseignants),
+        "teacher_details": enseignants_details,
         "period_start": date_debut_cours.isoformat(),
         "period_end": date_fin_comptabilisation.isoformat(),
         "file_format": nettoyer_texte(format_fichier),
@@ -1845,8 +2020,8 @@ def charger_historique_generations(limite=500):
         "GET",
         params=(
             "select=id,created_at,generated_by,generation_type,teachers,"
-            "teacher_count,period_start,period_end,file_format,file_name,"
-            "status,message,total_hsup"
+            "teacher_details,teacher_count,period_start,period_end,"
+            "file_format,file_name,status,message,total_hsup"
             f"&order=created_at.desc&limit={int(limite)}"
         ),
         admin=True,
@@ -1860,14 +2035,14 @@ def generer_excel_historique(historique):
         "Date et heure",
         "Administrateur",
         "Type de génération",
-        "Nombre d'enseignants",
         "Enseignants",
+        "Nom et prénom en arabe",
+        "E-mail",
+        "Téléphone",
+        "Qualité",
+        "Total charge (vacataire)",
         "Début de période",
         "Fin de période",
-        "Format du fichier",
-        "Nom du fichier",
-        "Statut",
-        "Message",
         "Total H.SUP",
     ]
 
@@ -1877,20 +2052,32 @@ def generer_excel_historique(historique):
         if isinstance(enseignants, str):
             enseignants = [enseignants]
 
-        lignes.append({
-            "Date et heure": nettoyer_texte(ligne.get("created_at", "")),
-            "Administrateur": nettoyer_texte(ligne.get("generated_by", "")),
-            "Type de génération": nettoyer_texte(ligne.get("generation_type", "")),
-            "Nombre d'enseignants": ligne.get("teacher_count", len(enseignants)),
-            "Enseignants": " ; ".join(nettoyer_texte(x) for x in enseignants),
-            "Début de période": nettoyer_texte(ligne.get("period_start", "")),
-            "Fin de période": nettoyer_texte(ligne.get("period_end", "")),
-            "Format du fichier": nettoyer_texte(ligne.get("file_format", "")),
-            "Nom du fichier": nettoyer_texte(ligne.get("file_name", "")),
-            "Statut": nettoyer_texte(ligne.get("status", "")),
-            "Message": nettoyer_texte(ligne.get("message", "")),
-            "Total H.SUP": nettoyer_texte(ligne.get("total_hsup", "")),
-        })
+        details = ligne.get("teacher_details") or []
+        if not isinstance(details, list):
+            details = []
+
+        details_par_nom = {}
+        for detail in details:
+            if isinstance(detail, dict):
+                details_par_nom[normaliser_nom(detail.get("nom", ""))] = detail
+
+        for nom in enseignants:
+            detail = details_par_nom.get(normaliser_nom(nom), {})
+
+            lignes.append({
+                "Date et heure": nettoyer_texte(ligne.get("created_at", "")),
+                "Administrateur": nettoyer_texte(ligne.get("generated_by", "")),
+                "Type de génération": nettoyer_texte(ligne.get("generation_type", "")),
+                "Enseignants": nettoyer_texte(nom),
+                "Nom et prénom en arabe": nettoyer_texte(detail.get("nom_arabe", "")),
+                "E-mail": nettoyer_texte(detail.get("email", "")),
+                "Téléphone": nettoyer_texte(detail.get("telephone", "")),
+                "Qualité": nettoyer_texte(detail.get("qualite", "")),
+                "Total charge (vacataire)": nettoyer_texte(detail.get("total_charge", "")),
+                "Début de période": nettoyer_texte(ligne.get("period_start", "")),
+                "Fin de période": nettoyer_texte(ligne.get("period_end", "")),
+                "Total H.SUP": nettoyer_texte(ligne.get("total_hsup", "")),
+            })
 
     df_historique = pd.DataFrame(lignes, columns=colonnes)
 
@@ -1900,8 +2087,8 @@ def generer_excel_historique(historique):
 
         ws = writer.sheets["Historique H.SUP"]
         largeurs = {
-            "A": 22, "B": 32, "C": 30, "D": 18, "E": 60, "F": 16, "G": 16,
-            "H": 28, "I": 45, "J": 14, "K": 45, "L": 18,
+            "A": 22, "B": 32, "C": 30, "D": 35, "E": 35, "F": 35, "G": 20,
+            "H": 18, "I": 22, "J": 16, "K": 16, "L": 18,
         }
         for colonne, largeur in largeurs.items():
             ws.column_dimensions[colonne].width = largeur
@@ -2037,6 +2224,20 @@ def authentifier_enseignant(liste_enseignants):
                 elif resultat and resultat.get("access_token"):
                     st.session_state["hsup_access_token"] = resultat["access_token"]
                     st.session_state["hsup_user"] = resultat.get("user", {})
+
+                    user_id_inscription = (
+                        resultat.get("user", {}).get("id", "")
+                    )
+                    if user_id_inscription:
+                        enregistrer_coordonnees_enseignant(
+                            user_id_inscription,
+                            nom_inscription,
+                            email_inscription.strip(),
+                            telephone_nettoye,
+                            ism_inscription.strip(),
+                            laqab_inscription.strip(),
+                        )
+
                     st.success("Compte créé et connecté.")
                     st.rerun()
                 else:
@@ -2064,10 +2265,33 @@ def mettre_a_jour_metadonnees_compte(donnees):
 
 
 def enregistrer_identite_enseignant_compte(ism, laqab, telephone):
-    """Enregistre l'identité arabe et le téléphone dans les métadonnées du compte."""
-    return mettre_a_jour_metadonnees_compte({
-        "ism_arabe": ism, "laqab_arabe": laqab, "telephone": telephone
+    """Enregistre l'identité arabe et le téléphone dans le compte."""
+    ok_meta, erreur_meta = mettre_a_jour_metadonnees_compte({
+        "ism_arabe": ism,
+        "laqab_arabe": laqab,
+        "telephone": telephone,
     })
+
+    if not ok_meta:
+        return False, erreur_meta
+
+    user_id = (
+        st.session_state.get("hsup_user") or {}
+    ).get("id", "")
+
+    if user_id:
+        ok_table, erreur_table = enregistrer_coordonnees_enseignant(
+            user_id,
+            enseignant_select,
+            st.session_state.get("hsup_user", {}).get("email", ""),
+            telephone,
+            ism,
+            laqab,
+        )
+        if not ok_table:
+            return False, erreur_table
+
+    return True, ""
 
 
 def lire_date_compte(valeur, defaut):
@@ -2080,6 +2304,9 @@ def lire_date_compte(valeur, defaut):
 try:
     df_enseignants, df_edt, dict_noms_arabe, liste_enseignants_actifs = charger_donnees()
     df_edt_complet = charger_edt_complet()
+    coordonnees_enseignants, erreur_coordonnees_enseignants = (
+        charger_coordonnees_enseignants_admin()
+    )
     enseignant_connecte, est_administrateur, profil_compte = authentifier_enseignant(
         liste_enseignants_actifs
     )
@@ -2378,6 +2605,13 @@ try:
         nom_fichier_clean = normaliser_nom(enseignant_select).replace(" ", "_")
         file_name = f"Etat_HSUP_Enseignant_{nom_fichier_clean}_2026_2027.xlsx"
 
+        details_individuel = construire_details_enseignants_historique(
+            [enseignant_select],
+            seances_par_enseignant={
+                normaliser_nom(enseignant_select): seances_pour_etat
+            },
+        )
+
         ok_historique_individuel, erreur_historique_individuel = enregistrer_historique_generation(
             generation_type="État H.SUP individuel",
             enseignants=[enseignant_select],
@@ -2389,6 +2623,7 @@ try:
                 f"{format_heures_arabe(total_general) or '0سا'}."
             ),
             total_hsup=format_heures_arabe(total_general) or "0سا",
+            enseignants_details=details_individuel,
         )
         st.success(
             f"État Excel généré. Total calculé sur les dates admissibles : "
@@ -2542,6 +2777,13 @@ try:
             key="hsup_excel_format",
         )
 
+        generer_sans_selection_admin = st.checkbox(
+            "Générer aussi les permanents sans sélection H.SUP enregistrée "
+            "(utiliser tous les enseignements EDT)",
+            value=False,
+            key="hsup_excel_sans_selection",
+        )
+
         choisis_hsup_excel = (
             set(enseignants_hsup_eligibles)
             if tous_hsup_excel
@@ -2577,6 +2819,7 @@ try:
                     )
                 else:
                     liste_hsup_excel = []
+                    seances_par_enseignant_hsup_excel = {}
 
                     for nom_hsup_excel in selection_hsup_excel:
                         nom_norm_hsup_excel = normaliser_nom(nom_hsup_excel)
@@ -2608,6 +2851,18 @@ try:
                                 )
                             )
 
+                            if (
+                                not enseignements_retenus_hsup_excel
+                                and generer_sans_selection_admin
+                            ):
+                                enseignements_retenus_hsup_excel = sorted(
+                                    {
+                                        nettoyer_texte(x)
+                                        for x in seances_hsup_excel["Enseignements"]
+                                        if nettoyer_texte(x)
+                                    }
+                                )
+
                             seances_pour_etat_hsup_excel, charge_semaine_hsup_excel, hsup_equivalent_hsup_excel = (
                                 limiter_enseignements_au_depassement(
                                     seances_hsup_excel,
@@ -2620,6 +2875,10 @@ try:
 
                         if seances_pour_etat_hsup_excel.empty:
                             continue
+
+                        seances_par_enseignant_hsup_excel[nom_norm_hsup_excel] = (
+                            seances_pour_etat_hsup_excel
+                        )
 
                         liste_hsup_excel.append(
                             (
@@ -2654,6 +2913,18 @@ try:
                                             [],
                                         )
                                     )
+
+                                    if (
+                                        not enseignements_retenus_fiche_hsup_excel
+                                        and generer_sans_selection_admin
+                                    ):
+                                        enseignements_retenus_fiche_hsup_excel = sorted(
+                                            {
+                                                nettoyer_texte(x)
+                                                for x in seances_fiche_hsup_excel["Enseignements"]
+                                                if nettoyer_texte(x)
+                                            }
+                                        )
 
                                     seances_fiche_hsup_excel, _, _ = (
                                         limiter_enseignements_au_depassement(
@@ -2693,6 +2964,11 @@ try:
 
                         buffer_zip_hsup_excel.seek(0)
 
+                        details_hsup_excel = construire_details_enseignants_historique(
+                            [e[0] for e in liste_hsup_excel],
+                            seances_par_enseignant=seances_par_enseignant_hsup_excel,
+                        )
+
                         st.session_state["hsup_excel_pret"] = {
                             "data": buffer_zip_hsup_excel.getvalue(),
                             "nom": "Etats_HSUP_Enseignants_ELT_2026_2027.zip",
@@ -2707,9 +2983,15 @@ try:
                             nom_fichier="Etats_HSUP_Enseignants_ELT_2026_2027.zip",
                             statut="Succès",
                             message=f"{len(liste_hsup_excel)} fichier(s) Excel individuel(s) généré(s).",
+                            enseignants_details=details_hsup_excel,
                         )
 
                     else:
+                        details_hsup_excel = construire_details_enseignants_historique(
+                            selection_hsup_excel,
+                            seances_par_enseignant=seances_par_enseignant_hsup_excel,
+                        )
+
                         buffer_hsup_excel, nombre_fiches_hsup_excel = generer_excel_groupe(
                             df_enseignants,
                             df_edt,
@@ -2736,6 +3018,7 @@ try:
                             nom_fichier="Etats_HSUP_Enseignants_Selectionnes_ELT_2026_2027.xlsx",
                             statut="Succès",
                             message=f"{nombre_fiches_hsup_excel} fiche(s) H.SUP générée(s).",
+                            enseignants_details=details_hsup_excel,
                         )
 
         pret_hsup_excel = st.session_state.get("hsup_excel_pret")
@@ -2765,11 +3048,29 @@ try:
                     st.stop()
                 liste_a_generer = [n for n in liste_enseignants_actifs
                                    if normaliser_nom(n) not in exclus_admin]
+
+                seances_par_enseignant_groupe = {}
+                for nom_groupe in liste_a_generer:
+                    nom_norm_groupe = normaliser_nom(nom_groupe)
+                    seances_groupe = df_edt[
+                        df_edt["Enseignants"].apply(
+                            lambda x: correspond_enseignant(x, nom_norm_groupe)
+                        )
+                    ].copy()
+                    if not seances_groupe.empty:
+                        seances_par_enseignant_groupe[nom_norm_groupe] = seances_groupe
+
+                details_groupe = construire_details_enseignants_historique(
+                    liste_a_generer,
+                    seances_par_enseignant=seances_par_enseignant_groupe,
+                )
+
                 buffer_groupe, nb_fiches = generer_excel_groupe(
                     df_enseignants, df_edt, liste_a_generer, dict_noms_arabe,
                     date_debut_cours, date_fin_comptabilisation, exclusions_par_mois,
                     selections_hsup_par_enseignant=preferences_admin
                 )
+
             st.success(f"Classeur groupé généré : {nb_fiches} fiches individuelles.")
 
             ok_historique_groupe, erreur_historique_groupe = enregistrer_historique_generation(
@@ -2779,8 +3080,8 @@ try:
                 nom_fichier="Etats_HSUP_Tous_Enseignants_ELT_2026_2027.xlsx",
                 statut="Succès",
                 message=f"{nb_fiches} fiche(s) H.SUP individuelle(s) générée(s).",
+                enseignants_details=details_groupe,
             )
-
             st.download_button(
                 label="📥 Télécharger toutes les fiches H.SUP (Excel multifeuille)",
                 data=buffer_groupe,
@@ -2796,7 +3097,10 @@ try:
         st.caption(
             "Cet historique enregistre chaque génération d'état H.SUP Excel : "
             "génération individuelle, classeur groupé de tous les enseignants ou "
-            "génération Excel pour une sélection d'enseignants."
+            "génération Excel pour une sélection d'enseignants. "
+            "Pour chaque enseignant, le nom en arabe, l'e-mail, le téléphone, "
+            "la qualité, la charge du vacataire, la période et le total H.SUP "
+            "sont enregistrés."
         )
 
         historique_generations, erreur_historique_generations = charger_historique_generations()
@@ -2816,22 +3120,36 @@ try:
                 if isinstance(enseignants_historique, str):
                     enseignants_historique = [enseignants_historique]
 
-                lignes_historique.append({
-                    "Date et heure": nettoyer_texte(ligne_historique.get("created_at", "")),
-                    "Administrateur": nettoyer_texte(ligne_historique.get("generated_by", "")),
-                    "Type de génération": nettoyer_texte(ligne_historique.get("generation_type", "")),
-                    "Nombre d'enseignants": ligne_historique.get("teacher_count", len(enseignants_historique)),
-                    "Enseignants": " ; ".join(
-                        nettoyer_texte(x) for x in enseignants_historique
-                    ),
-                    "Début de période": nettoyer_texte(ligne_historique.get("period_start", "")),
-                    "Fin de période": nettoyer_texte(ligne_historique.get("period_end", "")),
-                    "Format du fichier": nettoyer_texte(ligne_historique.get("file_format", "")),
-                    "Nom du fichier": nettoyer_texte(ligne_historique.get("file_name", "")),
-                    "Statut": nettoyer_texte(ligne_historique.get("status", "")),
-                    "Message": nettoyer_texte(ligne_historique.get("message", "")),
-                    "Total H.SUP": nettoyer_texte(ligne_historique.get("total_hsup", "")),
-                })
+                details = ligne_historique.get("teacher_details") or []
+                if not isinstance(details, list):
+                    details = []
+
+                details_par_nom = {}
+                for detail in details:
+                    if isinstance(detail, dict):
+                        details_par_nom[
+                            normaliser_nom(detail.get("nom", ""))
+                        ] = detail
+
+                for nom_historique in enseignants_historique:
+                    detail = details_par_nom.get(
+                        normaliser_nom(nom_historique), {}
+                    )
+
+                    lignes_historique.append({
+                        "Date et heure": nettoyer_texte(ligne_historique.get("created_at", "")),
+                        "Administrateur": nettoyer_texte(ligne_historique.get("generated_by", "")),
+                        "Type de génération": nettoyer_texte(ligne_historique.get("generation_type", "")),
+                        "Enseignants": nettoyer_texte(nom_historique),
+                        "Nom et prénom en arabe": nettoyer_texte(detail.get("nom_arabe", "")),
+                        "E-mail": nettoyer_texte(detail.get("email", "")),
+                        "Téléphone": nettoyer_texte(detail.get("telephone", "")),
+                        "Qualité": nettoyer_texte(detail.get("qualite", "")),
+                        "Total charge (vacataire)": nettoyer_texte(detail.get("total_charge", "")),
+                        "Début de période": nettoyer_texte(ligne_historique.get("period_start", "")),
+                        "Fin de période": nettoyer_texte(ligne_historique.get("period_end", "")),
+                        "Total H.SUP": nettoyer_texte(ligne_historique.get("total_hsup", "")),
+                    })
 
             df_historique_affichage = pd.DataFrame(lignes_historique)
 

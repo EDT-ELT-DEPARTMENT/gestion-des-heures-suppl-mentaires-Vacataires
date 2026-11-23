@@ -2208,6 +2208,39 @@ def construire_exclusions_par_mois_admin(dates_exclues):
     return exclusions
 
 
+def fusionner_exclusions(*exclusions):
+    """Réunit plusieurs dictionnaires {mois: {dates}} de jours exclus."""
+    resultat = {}
+    for ex in exclusions:
+        for mois, dates in (ex or {}).items():
+            resultat.setdefault(mois, set()).update(dates)
+    return resultat
+
+
+def calendrier_exclusions_admin(cle_base, sauvegarde, date_debut, date_fin):
+    """Sélecteur de jours à exclure, mois par mois. Retourne {mois: {dates exclues}}."""
+    exclusions = {}
+    colonnes = st.columns(len(MOIS_BLOCKS))
+    for col, bloc in zip(colonnes, MOIS_BLOCKS):
+        with col:
+            st.markdown(f"**{bloc['nom']}**")
+            labels = etiquettes_dates(bloc["annee"], bloc["mois"])
+            dates_ok = [
+                c for c in labels
+                if date_debut <= date.fromisoformat(c) <= date_fin
+            ]
+            defaut = [x for x in (sauvegarde or {}).get(str(bloc["mois"]), []) if x in dates_ok]
+            choix = st.multiselect(
+                f"Dates à exclure – {bloc['nom']}",
+                options=dates_ok,
+                default=defaut,
+                format_func=lambda x, d=labels: d[x],
+                key=f"{cle_base}_{bloc['annee']}_{bloc['mois']}",
+            )
+            exclusions[bloc["mois"]] = {date.fromisoformat(x) for x in choix}
+    return exclusions
+
+
 def extraire_noms_enseignants_edt(df_edt_source):
     """Extrait les noms d'enseignants depuis la colonne Enseignants de l'EDT."""
     noms = {}
@@ -3014,6 +3047,13 @@ def lire_date_compte(valeur, defaut):
 try:
     df_enseignants, df_edt, dict_noms_arabe, liste_enseignants_actifs = charger_donnees()
     df_edt_complet = charger_edt_complet()
+    # Seul le département ELT est traité (EDT, charges et états H.SUP).
+    if "Département" in df_edt_complet.columns:
+        _attrs_edt = dict(df_edt_complet.attrs)
+        df_edt_complet = df_edt_complet[
+            df_edt_complet["Département"].fillna("").astype(str).str.strip().str.upper().eq("ELT")
+        ].copy()
+        df_edt_complet.attrs.update(_attrs_edt)
     if df_edt_complet.attrs.get("lignes_ignorees"):
         st.caption(
             f"ℹ️ {df_edt_complet.attrs['lignes_ignorees']} ligne(s) vide(s) ou « Non défini » "
@@ -3366,44 +3406,24 @@ try:
             "Accès administrateur confirmé. Vous pouvez préparer les emplois du temps "
             "et les états H.SUP de l'ensemble des enseignants."
         )
-        # ---- Département : toutes les listes, calculs, EDT et états en dépendent ----
-        st.subheader("🏛️ Département")
+        # ---- Département ELT uniquement ; enseignants du fichier du personnel uniquement ----
+        departement_choisi = "ELT"
+        inclure_autres_dept = False
         df_edt_complet_tous = df_edt_complet
-        colonne_dept = (
-            df_edt_complet_tous["Département"].fillna("").astype(str).str.strip().str.upper()
-            if "Département" in df_edt_complet_tous.columns
-            else pd.Series("", index=df_edt_complet_tous.index)
-        )
-        departements_dispo = sorted({d for d in colonne_dept if d})
-        if not departements_dispo:
-            departements_dispo = ["ELT"]
-        departement_choisi = st.selectbox(
-            "Département concerné (calcul et génération des EDT et des états H.SUP)",
-            departements_dispo,
-            index=departements_dispo.index("ELT") if "ELT" in departements_dispo else 0,
-            key="admin_departement",
-        )
-        inclure_autres_dept = st.checkbox(
-            "Compter dans la charge de chaque enseignant les séances données dans les autres départements",
-            value=False,
-            key="admin_charge_tous_departements",
-            help=(
-                "Décoché : seules les séances du département choisi sont prises en compte "
-                "(charge réglementaire de 7 h, plafond de 12 h, EDT et états). "
-                "Coché : la charge de chaque enseignant est calculée sur toutes ses séances."
-            ),
-        )
-        df_edt_dept = df_edt_complet_tous[colonne_dept.eq(departement_choisi)].copy()
-        noms_departement = extraire_noms_enseignants_edt(df_edt_dept)
-        # Base de calcul pour tout l'espace administration ci-dessous.
-        df_edt_complet = df_edt_complet_tous if inclure_autres_dept else df_edt_dept
-        nb_par_categorie = {"permanent": 0, "vacataire": 0, "autre": 0}
+        df_edt_dept = df_edt_complet_tous
+        # Seuls les enseignants présents dans « Permanents-Vacataires-ELT2-2026-2027.xlsx » sont proposés.
+        noms_departement = [
+            n for n in extraire_noms_enseignants_edt(df_edt_dept)
+            if categorie_enseignant(df_enseignants, normaliser_nom(n)) != "autre"
+        ]
+        nb_par_categorie = {"permanent": 0, "vacataire": 0}
         for n_dept in noms_departement:
             nb_par_categorie[categorie_enseignant(df_enseignants, normaliser_nom(n_dept))] += 1
+        st.subheader("🏛️ Département ELT")
         st.caption(
-            f"Département {departement_choisi} : {len(df_edt_dept)} séance(s), "
-            f"{nb_par_categorie['permanent']} permanent(s), {nb_par_categorie['vacataire']} vacataire(s), "
-            f"{nb_par_categorie['autre']} enseignant(s) hors fichier du personnel."
+            f"Département ELT : {len(df_edt_dept)} séance(s) ; "
+            f"{nb_par_categorie['permanent']} permanent(s) et {nb_par_categorie['vacataire']} vacataire(s) "
+            "du fichier du personnel ayant des séances."
         )
 
         st.subheader("📚 Téléchargement groupé de tous les enseignants")
@@ -3445,11 +3465,10 @@ try:
         )
         categorie_pdf_libelle = st.radio(
             "Catégorie d'enseignants",
-            ["Permanents", "Vacataires", "Hors fichier du personnel"],
+            ["Permanents", "Vacataires"],
             horizontal=True, key=f"edt_pdf_categorie_{departement_choisi}",
         )
-        cle_categorie_pdf = {"Permanents": "permanent", "Vacataires": "vacataire",
-                             "Hors fichier du personnel": "autre"}[categorie_pdf_libelle]
+        cle_categorie_pdf = {"Permanents": "permanent", "Vacataires": "vacataire"}[categorie_pdf_libelle]
         liste_pdf_dept = [
             n for n in noms_departement
             if categorie_enseignant(df_enseignants, normaliser_nom(n)) == cle_categorie_pdf
@@ -3766,8 +3785,8 @@ try:
             )
 
         # ---- États H.SUP Excel : génération séparée permanents / vacataires / hors fichier ----
-        for categorie, titre_cat, libelle_cat, legende_cat in [
-            c for c in (
+        exclusions_categories = {}   # calendrier (jours exclus) de chaque catégorie, rempli dans la boucle
+        for categorie, titre_cat, libelle_cat, legende_cat in (
             (
                 "permanent", "Enseignants permanents", "Permanents",
                 "États H.SUP des permanents : seuls les enseignements retenus comme H.SUP, au-delà de "
@@ -3776,17 +3795,11 @@ try:
             ),
             (
                 "vacataire", "Enseignants vacataires", "Vacataires",
-                "États des vacataires (selon le fichier du personnel) : toutes les séances "
+                "États des vacataires du fichier du personnel : toutes les séances "
                 "réelles sont comptées, dans la limite de 12 h par semaine. Au-delà, utilisez la "
                 "simulation de suppression ci-dessus pour choisir les enseignements à retirer.",
             ),
-            (
-                "autre", "Enseignants hors fichier du personnel", "HorsFichier",
-                "Enseignants présents dans l'EDT du département mais absents du fichier du personnel "
-                "(par exemple d'autres départements) : séances réelles, dans la limite de 12 h par semaine.",
-            ),
-            ) if nb_par_categorie[c[0]] > 0 or c[0] != "autre"
-        ]:
+        ):
             cle_pret = f"hsup_excel_pret_{categorie}_{departement_choisi}"
             # ---- Etats des heures sups en Excel : un ou plusieurs enseignants ----
             st.divider()
@@ -3865,6 +3878,46 @@ try:
                     f"l'état sera plafonné à {plafond_cat:g} h par semaine."
                 )
 
+            # ---- Calendrier et jours à exclure pour toute la catégorie ----
+            cle_calendrier = f"{departement_choisi}:{categorie}"
+            calendriers_sauves = metadata_compte_cal.get("hsup_admin_calendriers", {}) or {}
+            with st.expander(
+                f"📅 Calendrier et jours à exclure — {titre_cat} ({departement_choisi})",
+                expanded=False,
+            ):
+                st.caption(
+                    "Les jours choisis ne sont pas comptés pour tous les enseignants de cette catégorie. "
+                    "Ils s'ajoutent aux jours exclus propres à chaque enseignant (réglages ci-dessous) et "
+                    "aux vendredis, samedis et jours fériés, déjà exclus automatiquement. "
+                    f"Période comptabilisée : du {date_debut_cours.strftime('%d/%m/%Y')} "
+                    f"au {date_fin_comptabilisation.strftime('%d/%m/%Y')}."
+                )
+                exclusions_categorie = calendrier_exclusions_admin(
+                    f"hsup_admin_cal_{departement_choisi}_{categorie}",
+                    calendriers_sauves.get(cle_calendrier, {}),
+                    date_debut_cours,
+                    date_fin_comptabilisation,
+                )
+                if st.button(
+                    "💾 Enregistrer ce calendrier",
+                    key=f"hsup_admin_cal_save_{departement_choisi}_{categorie}",
+                    use_container_width=True,
+                ):
+                    nouveaux_calendriers = dict(calendriers_sauves)
+                    nouveaux_calendriers[cle_calendrier] = {
+                        str(mois): sorted(d.isoformat() for d in dates)
+                        for mois, dates in exclusions_categorie.items()
+                    }
+                    ok_cal_cat, erreur_cal_cat = mettre_a_jour_metadonnees_compte(
+                        {"hsup_admin_calendriers": nouveaux_calendriers}
+                    )
+                    if ok_cal_cat:
+                        st.success("Calendrier enregistré.")
+                        st.rerun()
+                    else:
+                        st.error(f"Impossible d'enregistrer le calendrier : {erreur_cal_cat}")
+            exclusions_categories[categorie] = exclusions_categorie
+
             for nom_reglage in selection_hsup_excel:
                 nom_norm_reglage = normaliser_nom(nom_reglage)
                 ligne_reglage = df_enseignants[
@@ -3933,18 +3986,20 @@ try:
                             key=f"hsup_admin_enseignements_{nom_norm_reglage}",
                         )
 
-                        dates_exclues_reglage = st.multiselect(
-                            "Jours à exclure du calcul H.SUP",
-                            options=dates_periode_admin,
-                            default=reglages_admin_dates.get(
-                                nom_norm_reglage, []
-                            ),
-                            format_func=lambda d: d.strftime("%d/%m/%Y"),
-                            key=f"hsup_admin_dates_{nom_norm_reglage}",
-                        )
                     else:
                         selections_reglage = []
-                        dates_exclues_reglage = []
+
+                    # Jours à exclure propres à cet enseignant (permanent ou vacataire).
+                    dates_exclues_reglage = st.multiselect(
+                        "Jours à exclure du calcul (cet enseignant)",
+                        options=dates_periode_admin,
+                        default=[
+                            d for d in reglages_admin_dates.get(nom_norm_reglage, [])
+                            if d in dates_periode_admin
+                        ],
+                        format_func=lambda d: d.strftime("%d/%m/%Y"),
+                        key=f"hsup_admin_dates_{nom_norm_reglage}",
+                    )
 
                     if st.button(
                         f"💾 Enregistrer les réglages de {nom_reglage}",
@@ -4147,13 +4202,14 @@ try:
                                     if seances_fiche_hsup_excel.empty:
                                         continue
 
-                                    exclusions_fiche_hsup_excel = (
+                                    exclusions_fiche_hsup_excel = fusionner_exclusions(
+                                        exclusions_categories.get(categorie, {}),
                                         construire_exclusions_par_mois_admin(
                                             reglages_admin_dates.get(
                                                 normaliser_nom(nom_fiche_hsup_excel),
                                                 [],
                                             )
-                                        )
+                                        ),
                                     )
 
                                     buffer_fiche_hsup_excel, total_fiche_hsup_excel, details_fiche_hsup_excel = (
@@ -4210,13 +4266,14 @@ try:
                             )
 
                             exclusions_par_enseignant_hsup_excel = {
-                                normaliser_nom(nom_hsup_excel): (
+                                normaliser_nom(nom_hsup_excel): fusionner_exclusions(
+                                    exclusions_categories.get(categorie, {}),
                                     construire_exclusions_par_mois_admin(
                                         reglages_admin_dates.get(
                                             normaliser_nom(nom_hsup_excel),
                                             [],
                                         )
-                                    )
+                                    ),
                                 )
                                 for nom_hsup_excel in selection_hsup_excel
                             }
@@ -4341,10 +4398,13 @@ try:
                         preferences_admin.get(nom_norm_groupe, [])
                         or reglages_admin_selections_groupe.get(nom_norm_groupe, [])
                     )
-                    exclusions_par_enseignant_groupe[nom_norm_groupe] = (
+                    exclusions_par_enseignant_groupe[nom_norm_groupe] = fusionner_exclusions(
+                        exclusions_categories.get(
+                            categorie_enseignant(df_enseignants, nom_norm_groupe), {}
+                        ),
                         construire_exclusions_par_mois_admin(
                             reglages_admin_dates_groupe.get(nom_norm_groupe, [])
-                        )
+                        ),
                     )
 
                 buffer_groupe, nb_fiches = generer_excel_groupe(

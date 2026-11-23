@@ -507,39 +507,44 @@ def etiquettes_dates(annee, mois):
 
 
 def cle_horaire_enseignement(ligne):
-    """Clé d'une séance simultanée : jour + horaire + type (promotion ignorée)."""
+    """Clé d'une cellule de l'EDT : jour + horaire (type, intitulé et promotion ignorés)."""
     horaire = nettoyer_texte(ligne.get("Horaire", ""))
     jour = nettoyer_texte(ligne.get("JOUR_NORM", ligne.get("Jours", ""))).casefold()
-    nature = type_enseignement(ligne.get("Enseignements", ""))
-    return jour, re.sub(r"\s+", "", horaire).casefold(), nature
+    return jour, re.sub(r"\s+", "", horaire).casefold()
 
 
 def dedoublonner_seances_simultanees(seances):
-    """Une seule séance par jour/horaire/type pour un même enseignant.
+    """Une seule séance par cellule (même jour et même horaire) pour un même enseignant.
 
-    Les promotions et les intitulés peuvent différer : si le même enseignant
-    assure au même moment plusieurs Cours, TD ou TP pour plusieurs promotions,
-    le créneau est compté une seule fois. Les types différents restent distincts.
+    Si l'enseignant a plusieurs enseignements dans la même cellule, quels que soient
+    leur type (Cours, TD, TP), leur intitulé ou leur promotion, le créneau n'est compté
+    qu'une fois. Quand les types diffèrent, on garde de préférence le Cours, puis le TD,
+    puis le TP (priorité à l'heure équivalent-cours la plus favorable), sinon la première ligne.
     """
     if seances.empty:
         return seances.copy()
     travail = seances.copy()
     if "JOUR_NORM" not in travail.columns:
         travail["JOUR_NORM"] = travail.get("Jours", "").apply(normaliser_nom).str.lower()
-    travail["_TYPE_HSUP"] = travail["Enseignements"].apply(type_enseignement)
+    ordre_type = {"cours": 0, "td": 1, "tp": 2}
+    travail["_POS_HSUP"] = range(len(travail))
+    travail["_PRIO_HSUP"] = travail["Enseignements"].apply(
+        lambda x: ordre_type.get(type_enseignement(x), 3)
+    )
     travail["_HORAIRE_HSUP"] = travail["Horaire"].apply(
         lambda x: re.sub(r"\s+", "", nettoyer_texte(x)).casefold()
     )
-    # Les lignes sans type ou horaire interprétable ne sont pas fusionnées.
+    # Les lignes sans horaire interprétable ne sont pas fusionnées.
     travail["_CLE_SIMULTANEE"] = travail.apply(
-        lambda r: (r.get("JOUR_NORM", ""), r.get("_HORAIRE_HSUP", ""), r.get("_TYPE_HSUP", ""))
-        if r.get("_HORAIRE_HSUP") and r.get("_TYPE_HSUP") else ("LIGNE", int(r.name)), axis=1
+        lambda r: (r.get("JOUR_NORM", ""), r.get("_HORAIRE_HSUP", ""))
+        if r.get("_HORAIRE_HSUP") else ("LIGNE", int(r["_POS_HSUP"])), axis=1
     )
+    travail = travail.sort_values(["_PRIO_HSUP", "_POS_HSUP"], kind="stable")
     travail = travail.drop_duplicates(subset=["_CLE_SIMULTANEE"], keep="first")
-    return travail.drop(columns=["_TYPE_HSUP", "_HORAIRE_HSUP", "_CLE_SIMULTANEE"], errors="ignore")
-
-
-SEPARATEUR_CRENEAU_HSUP = " ▸ "
+    travail = travail.sort_values("_POS_HSUP", kind="stable")
+    return travail.drop(
+        columns=["_POS_HSUP", "_PRIO_HSUP", "_HORAIRE_HSUP", "_CLE_SIMULTANEE"], errors="ignore"
+    )
 
 
 def _norm_creneau_hsup(texte):
@@ -624,7 +629,7 @@ def calculer_charge_equivalente_hebdomadaire(seances):
     """Calcule la charge hebdomadaire en équivalent-cours après déduplication.
 
     1 h Cours = 1 h équivalent-cours ; 1,5 h TD ou TP = 1 h équivalent-cours.
-    Les promotions différentes au même jour/créneau/type ne sont comptées qu'une fois.
+    Plusieurs enseignements dans la même cellule (même jour, même horaire) ne sont comptés qu'une fois.
     """
     uniques = dedoublonner_seances_simultanees(seances)
     if uniques.empty:
@@ -771,8 +776,8 @@ def calculer_heures_par_jour(seances, annee, mois, date_debut, date_fin, exclusi
         lignes = seances[seances["JOUR_NORM"].eq(NOMS_JOURS_FR[d.weekday()])]
         if lignes.empty:
             continue
-        # Plusieurs promotions au même jour/créneau/type pour le même enseignant
-        # représentent une seule séance (Cours avec Cours, TD avec TD, TP avec TP).
+        # Plusieurs enseignements dans la même cellule (même jour et même horaire)
+        # représentent une seule séance, quels que soient leur type et leur promotion.
         lignes = dedoublonner_seances_simultanees(lignes)
         resultats.append({
             "date": d,
@@ -2494,7 +2499,7 @@ LIBELLES_CATEGORIE = {"permanent": "Permanent", "vacataire": "Vacataire", "autre
 
 
 def charge_hebdo_vacataire(seances):
-    """Heures réelles par semaine (séances simultanées de même type comptées une seule fois)."""
+    """Heures réelles par semaine (plusieurs enseignements d'une même cellule comptés une seule fois)."""
     if seances is None or seances.empty:
         return 0.0
     ded = dedoublonner_seances_simultanees(seances)
@@ -3282,8 +3287,9 @@ try:
         st.markdown("### ⚙️ Déclaration des enseignements à comptabiliser comme heures supplémentaires")
         st.info(
             "Sélectionnez uniquement les enseignements que vous souhaitez faire apparaître "
-            "dans votre état H.SUP. Les séances simultanées de même type (Cours, TD ou TP), "
-            "même si elles concernent plusieurs promotions, seront comptées une seule fois. "
+            "dans votre état H.SUP. Plusieurs enseignements placés dans la même cellule "
+            "(même jour et même horaire), même de types ou de promotions différents, "
+            "seront comptés une seule fois. "
             "Cette sélection ne modifie pas l'emploi du temps affiché."
         )
         metadata_hsup = profil_compte.get("user_metadata") or {}

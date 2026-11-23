@@ -2212,11 +2212,13 @@ def extraire_noms_enseignants_edt(df_edt_source):
     """Extrait les noms d'enseignants depuis la colonne Enseignants de l'EDT."""
     noms = {}
     for valeur in df_edt_source["Enseignants"].fillna("").astype(str):
-        for morceau in re.split(r"[,;]|\bet\b", valeur, flags=re.IGNORECASE):
+        for morceau in re.split(r"[,;/+&\n]|\bet\b", valeur, flags=re.IGNORECASE):
             nom = nettoyer_texte(morceau)
             if not nom:
                 continue
             cle = normaliser_nom(nom)
+            if "NON DEFINI" in cle:      # espace réservé de l'EDT, pas un enseignant
+                continue
             if cle and cle not in noms:
                 noms[cle] = nom
     return [noms[cle] for cle in sorted(noms)]
@@ -2443,10 +2445,19 @@ _ORDRE_SEMAINE_DZ = {"dimanche": 0, "lundi": 1, "mardi": 2, "mercredi": 3, "jeud
 
 
 def categorie_enseignant(df_enseignants, nom_norm):
-    """« permanent » ou « vacataire » (tout enseignant non permanent, y compris non inscrit)."""
+    """« permanent » / « vacataire » d'après le fichier du personnel, « autre » si absent du fichier.
+
+    Les enseignants « autre » (par exemple d'un autre département) ne sont jamais mélangés avec
+    les vacataires ; pour le calcul ils suivent la règle des vacataires (séances réelles, 12 h max).
+    """
     ligne = df_enseignants[df_enseignants["NOM_NORM"].eq(nom_norm)]
-    qualite = nettoyer_texte(ligne.iloc[0].get("Qualité", "")) if not ligne.empty else ""
+    if ligne.empty:
+        return "autre"
+    qualite = nettoyer_texte(ligne.iloc[0].get("Qualité", ""))
     return "permanent" if "permanent" in qualite.casefold() else "vacataire"
+
+
+LIBELLES_CATEGORIE = {"permanent": "Permanent", "vacataire": "Vacataire", "autre": "Hors fichier du personnel"}
 
 
 def charge_hebdo_vacataire(seances):
@@ -2522,7 +2533,7 @@ def detecter_depassements_plafond(df_complet, df_enseignants, noms, selections_p
             cat = categorie_enseignant(df_enseignants, nn)
             lignes.append({
                 "Enseignant": nom,
-                "Catégorie": "Permanent" if cat == "permanent" else "Vacataire",
+                "Catégorie": LIBELLES_CATEGORIE.get(cat, cat),
                 "Mesure": "H.SUP / semaine" if cat == "permanent" else "Charge / semaine",
                 "Valeur": f"{valeur:.2f} h",
                 "Plafond": f"{PLAFOND_HSUP_HEBDO if cat == 'permanent' else PLAFOND_VACATAIRE_HEBDO:g} h",
@@ -3355,6 +3366,46 @@ try:
             "Accès administrateur confirmé. Vous pouvez préparer les emplois du temps "
             "et les états H.SUP de l'ensemble des enseignants."
         )
+        # ---- Département : toutes les listes, calculs, EDT et états en dépendent ----
+        st.subheader("🏛️ Département")
+        df_edt_complet_tous = df_edt_complet
+        colonne_dept = (
+            df_edt_complet_tous["Département"].fillna("").astype(str).str.strip().str.upper()
+            if "Département" in df_edt_complet_tous.columns
+            else pd.Series("", index=df_edt_complet_tous.index)
+        )
+        departements_dispo = sorted({d for d in colonne_dept if d})
+        if not departements_dispo:
+            departements_dispo = ["ELT"]
+        departement_choisi = st.selectbox(
+            "Département concerné (calcul et génération des EDT et des états H.SUP)",
+            departements_dispo,
+            index=departements_dispo.index("ELT") if "ELT" in departements_dispo else 0,
+            key="admin_departement",
+        )
+        inclure_autres_dept = st.checkbox(
+            "Compter dans la charge de chaque enseignant les séances données dans les autres départements",
+            value=False,
+            key="admin_charge_tous_departements",
+            help=(
+                "Décoché : seules les séances du département choisi sont prises en compte "
+                "(charge réglementaire de 7 h, plafond de 12 h, EDT et états). "
+                "Coché : la charge de chaque enseignant est calculée sur toutes ses séances."
+            ),
+        )
+        df_edt_dept = df_edt_complet_tous[colonne_dept.eq(departement_choisi)].copy()
+        noms_departement = extraire_noms_enseignants_edt(df_edt_dept)
+        # Base de calcul pour tout l'espace administration ci-dessous.
+        df_edt_complet = df_edt_complet_tous if inclure_autres_dept else df_edt_dept
+        nb_par_categorie = {"permanent": 0, "vacataire": 0, "autre": 0}
+        for n_dept in noms_departement:
+            nb_par_categorie[categorie_enseignant(df_enseignants, normaliser_nom(n_dept))] += 1
+        st.caption(
+            f"Département {departement_choisi} : {len(df_edt_dept)} séance(s), "
+            f"{nb_par_categorie['permanent']} permanent(s), {nb_par_categorie['vacataire']} vacataire(s), "
+            f"{nb_par_categorie['autre']} enseignant(s) hors fichier du personnel."
+        )
+
         st.subheader("📚 Téléchargement groupé de tous les enseignants")
         preferences_admin, exclus_admin, erreur_preferences = charger_preferences_hsup_admin()
         if erreur_preferences:
@@ -3390,24 +3441,40 @@ try:
         st.markdown("#### 🗓️ Emplois du temps PDF (un ou plusieurs enseignants)")
         st.caption(
             "L'ordre est identique à celui du classeur Excel groupé : l'ordre alphabétique de la liste "
-            "« Choisir un enseignant permanent ou vacataire »."
+            "« Catégorie d'enseignants » du département choisi."
         )
-        tous_edt = st.checkbox("Sélectionner tous les enseignants", key="edt_pdf_tous")
+        categorie_pdf_libelle = st.radio(
+            "Catégorie d'enseignants",
+            ["Permanents", "Vacataires", "Hors fichier du personnel"],
+            horizontal=True, key=f"edt_pdf_categorie_{departement_choisi}",
+        )
+        cle_categorie_pdf = {"Permanents": "permanent", "Vacataires": "vacataire",
+                             "Hors fichier du personnel": "autre"}[categorie_pdf_libelle]
+        liste_pdf_dept = [
+            n for n in noms_departement
+            if categorie_enseignant(df_enseignants, normaliser_nom(n)) == cle_categorie_pdf
+        ]
+        tous_edt = st.checkbox(
+            "Sélectionner tous les enseignants de cette catégorie",
+            key=f"edt_pdf_tous_{departement_choisi}_{cle_categorie_pdf}",
+        )
         choix_edt = st.multiselect(
-            "Enseignants à inclure", options=liste_enseignants_actifs,
-            default=[enseignant_select], disabled=tous_edt, key="edt_pdf_choix",
+            f"Enseignants ({categorie_pdf_libelle.lower()}) du département {departement_choisi}",
+            options=liste_pdf_dept,
+            default=[enseignant_select] if enseignant_select in liste_pdf_dept else [],
+            disabled=tous_edt, key=f"edt_pdf_choix_{departement_choisi}_{cle_categorie_pdf}",
         )
         format_edt = st.radio(
             "Format du téléchargement",
             ["Un seul PDF (une page par enseignant)", "Un PDF par enseignant (fichier ZIP)"],
-            horizontal=True, key="edt_pdf_format",
+            horizontal=True, key=f"edt_pdf_format_{departement_choisi}",
         )
-        choisis = set(liste_enseignants_actifs) if tous_edt else set(choix_edt)
-        # On parcourt la liste de référence : l'ordre est donc celui de l'Excel, quel que soit l'ordre de clic.
-        selection_edt = [n for n in liste_enseignants_actifs if n in choisis]
+        choisis = set(liste_pdf_dept) if tous_edt else set(choix_edt)
+        # Ordre alphabétique, quel que soit l'ordre de clic.
+        selection_edt = [n for n in liste_pdf_dept if n in choisis]
         st.caption(f"{len(selection_edt)} enseignant(s) sélectionné(s).")
         if st.button("🗓️ Préparer le téléchargement des emplois du temps",
-                     use_container_width=True, disabled=not selection_edt, key="edt_pdf_preparer"):
+                     use_container_width=True, disabled=not selection_edt, key=f"edt_pdf_preparer_{departement_choisi}_{cle_categorie_pdf}"):
             with st.spinner("Génération des grilles d'emploi du temps..."):
                 liste_edt = []
                 for nom_edt in selection_edt:
@@ -3429,25 +3496,29 @@ try:
                 elif format_edt.startswith("Un PDF par"):
                     st.session_state["edt_pdf_pret"] = {
                         "data": generer_zip_edt(liste_edt).getvalue(),
-                        "nom": "EDT_Tous_Enseignants_ELT_2027.zip", "mime": "application/zip",
+                        "nom": f"EDT_{departement_choisi}_{categorie_pdf_libelle.split()[0]}.zip", "mime": "application/zip",
                         "ordre": [e[0] for e in liste_edt],
+                        "departement": departement_choisi,
                     }
                 else:
                     st.session_state["edt_pdf_pret"] = {
                         "data": generer_pdf_edt(liste_edt).getvalue(),
                         "nom": (nom_fichier_edt(liste_edt[0][0]) if len(liste_edt) == 1
-                                else "EDT_Tous_Enseignants_ELT_2027.pdf"),
+                                else f"EDT_{departement_choisi}_{categorie_pdf_libelle.split()[0]}.pdf"),
                         "mime": "application/pdf",
                         "ordre": [e[0] for e in liste_edt],
+                        "departement": departement_choisi,
                     }
         pret = st.session_state.get("edt_pdf_pret")
+        if pret and pret.get("departement") != departement_choisi:
+            pret = None
         if pret:
             st.success(f"{len(pret['ordre'])} emploi(s) du temps prêt(s) : " + " → ".join(pret["ordre"][:8])
                        + (" …" if len(pret["ordre"]) > 8 else ""))
             st.download_button(
                 label=f"📥 Télécharger ({pret['nom']})",
                 data=pret["data"], file_name=pret["nom"], mime=pret["mime"],
-                use_container_width=True, key="download_edt_selection",
+                use_container_width=True, key=f"download_edt_selection_{departement_choisi}",
             )
 
         # ---- Simulation : supprimer des enseignements pour respecter le plafond hebdomadaire ----
@@ -3490,7 +3561,7 @@ try:
         df_edt_origine = df_edt
 
         enseignants_sim_tous = [
-            n for n in extraire_noms_enseignants_edt(df_edt_complet_origine)
+            n for n in noms_departement
             if normaliser_nom(n) not in exclus_admin
         ]
 
@@ -3523,10 +3594,11 @@ try:
 
             def _etiquette_sim(n):
                 cat = categorie_enseignant(df_enseignants, normaliser_nom(n))
-                return f"{n} — {'permanent' if cat == 'permanent' else 'vacataire'}"
+                return f"{n} — {LIBELLES_CATEGORIE[cat].lower()}"
 
             nom_sim = st.selectbox(
-                "Enseignant à simuler", options_sim, format_func=_etiquette_sim, key="sim_supp_enseignant"
+                "Enseignant à simuler", options_sim, format_func=_etiquette_sim,
+                key=f"sim_supp_enseignant_{departement_choisi}_{int(inclure_autres_dept)}"
             )
             nom_norm_sim = normaliser_nom(nom_sim)
             est_permanent_sim = categorie_enseignant(df_enseignants, nom_norm_sim) == "permanent"
@@ -3546,7 +3618,7 @@ try:
                     "Enseignements à supprimer (par créneau)",
                     options=options_supp,
                     default=[x for x in deja_valides if x in options_supp],
-                    key=f"sim_supp_choix_{nom_norm_sim}",
+                    key=f"sim_supp_choix_{nom_norm_sim}_{departement_choisi}_{int(inclure_autres_dept)}",
                 )
 
                 def _fmt(v):
@@ -3693,8 +3765,9 @@ try:
                 "(simulation ci-dessus). Annulez-les pour revenir à l'EDT d'origine."
             )
 
-        # ---- États H.SUP Excel : génération séparée permanents / vacataires ----
-        for categorie, titre_cat, libelle_cat, legende_cat in (
+        # ---- États H.SUP Excel : génération séparée permanents / vacataires / hors fichier ----
+        for categorie, titre_cat, libelle_cat, legende_cat in [
+            c for c in (
             (
                 "permanent", "Enseignants permanents", "Permanents",
                 "États H.SUP des permanents : seuls les enseignements retenus comme H.SUP, au-delà de "
@@ -3703,25 +3776,31 @@ try:
             ),
             (
                 "vacataire", "Enseignants vacataires", "Vacataires",
-                "États des vacataires (y compris les enseignants non inscrits) : toutes les séances "
+                "États des vacataires (selon le fichier du personnel) : toutes les séances "
                 "réelles sont comptées, dans la limite de 12 h par semaine. Au-delà, utilisez la "
                 "simulation de suppression ci-dessus pour choisir les enseignements à retirer.",
             ),
-        ):
-            cle_pret = f"hsup_excel_pret_{categorie}"
+            (
+                "autre", "Enseignants hors fichier du personnel", "HorsFichier",
+                "Enseignants présents dans l'EDT du département mais absents du fichier du personnel "
+                "(par exemple d'autres départements) : séances réelles, dans la limite de 12 h par semaine.",
+            ),
+            ) if nb_par_categorie[c[0]] > 0 or c[0] != "autre"
+        ]:
+            cle_pret = f"hsup_excel_pret_{categorie}_{departement_choisi}"
             # ---- Etats des heures sups en Excel : un ou plusieurs enseignants ----
             st.divider()
-            st.markdown(f"#### 🗓️ États des heures sups en Excel — {titre_cat}")
+            st.markdown(f"#### 🗓️ États des heures sups en Excel — {titre_cat} ({departement_choisi})")
             st.caption(legende_cat)
 
             tous_hsup_excel = st.checkbox(
                 "Sélectionner tous les enseignants éligibles",
-                key=f"hsup_excel_tous_{categorie}",
+                key=f"hsup_excel_tous_{categorie}_{departement_choisi}",
             )
 
             # Enseignants de l'EDT complet appartenant à cette catégorie (inscrits ou non).
             enseignants_edt_complet = [
-                n for n in extraire_noms_enseignants_edt(df_edt_complet)
+                n for n in noms_departement
                 if categorie_enseignant(df_enseignants, normaliser_nom(n)) == categorie
             ]
 
@@ -3735,7 +3814,7 @@ try:
                 options=enseignants_hsup_eligibles,
                 default=[enseignant_select] if enseignant_select in enseignants_hsup_eligibles else [],
                 disabled=tous_hsup_excel,
-                key=f"hsup_excel_choix_{categorie}",
+                key=f"hsup_excel_choix_{categorie}_{departement_choisi}",
             )
 
             format_hsup_excel = st.radio(
@@ -3745,7 +3824,7 @@ try:
                     "Un fichier Excel par enseignant (fichier ZIP)",
                 ],
                 horizontal=True,
-                key=f"hsup_excel_format_{categorie}",
+                key=f"hsup_excel_format_{categorie}_{departement_choisi}",
             )
 
             choisis_hsup_excel = (
@@ -3894,7 +3973,7 @@ try:
                 f"🗓️ Préparer les états H.SUP Excel — {titre_cat}",
                 use_container_width=True,
                 disabled=not selection_hsup_excel,
-                key=f"hsup_excel_preparer_{categorie}",
+                key=f"hsup_excel_preparer_{categorie}_{departement_choisi}",
             ):
                 with st.spinner("Génération des états H.SUP Excel..."):
 
@@ -4109,16 +4188,16 @@ try:
 
                             st.session_state[cle_pret] = {
                                 "data": buffer_zip_hsup_excel.getvalue(),
-                                "nom": f"Etats_HSUP_{libelle_cat}_ELT_2026_2027.zip",
+                                "nom": f"Etats_HSUP_{libelle_cat}_{departement_choisi}_2026_2027.zip",
                                 "mime": "application/zip",
                                 "ordre": [e[0] for e in liste_hsup_excel],
                             }
 
                             enregistrer_historique_generation(
-                                generation_type=f"États H.SUP Excel - {libelle_cat.lower()}",
+                                generation_type=f"États H.SUP Excel - {libelle_cat.lower()} ({departement_choisi})",
                                 enseignants=[e[0] for e in liste_hsup_excel],
                                 format_fichier="ZIP Excel",
-                                nom_fichier=f"Etats_HSUP_{libelle_cat}_ELT_2026_2027.zip",
+                                nom_fichier=f"Etats_HSUP_{libelle_cat}_{departement_choisi}_2026_2027.zip",
                                 statut="Succès",
                                 message=f"{len(liste_hsup_excel)} fichier(s) Excel individuel(s) généré(s).",
                                 enseignants_details=details_hsup_excel,
@@ -4171,17 +4250,17 @@ try:
 
                             st.session_state[cle_pret] = {
                                 "data": buffer_hsup_excel.getvalue(),
-                                "nom": f"Etats_HSUP_{libelle_cat}_Selectionnes_ELT_2026_2027.xlsx",
+                                "nom": f"Etats_HSUP_{libelle_cat}_Selectionnes_{departement_choisi}_2026_2027.xlsx",
                                 "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                 "ordre": selection_hsup_excel,
                                 "nombre_fiches": nombre_fiches_hsup_excel,
                             }
 
                             enregistrer_historique_generation(
-                                generation_type=f"États H.SUP Excel - {libelle_cat.lower()}",
+                                generation_type=f"États H.SUP Excel - {libelle_cat.lower()} ({departement_choisi})",
                                 enseignants=selection_hsup_excel,
                                 format_fichier="Excel multifeuille",
-                                nom_fichier=f"Etats_HSUP_{libelle_cat}_Selectionnes_ELT_2026_2027.xlsx",
+                                nom_fichier=f"Etats_HSUP_{libelle_cat}_Selectionnes_{departement_choisi}_2026_2027.xlsx",
                                 statut="Succès",
                                 message=f"{nombre_fiches_hsup_excel} fiche(s) H.SUP générée(s).",
                                 enseignants_details=details_hsup_excel,
@@ -4202,7 +4281,7 @@ try:
                     file_name=pret_hsup_excel["nom"],
                     mime=pret_hsup_excel["mime"],
                     use_container_width=True,
-                    key=f"download_hsup_excel_selection_{categorie}",
+                    key=f"download_hsup_excel_selection_{categorie}_{departement_choisi}",
                 )
 
         if st.button("📦 Générer le classeur Excel de tous les enseignants",
@@ -4212,7 +4291,7 @@ try:
                 if erreur_preferences:
                     st.error("Génération interrompue : préférences Supabase indisponibles. " + erreur_preferences)
                     st.stop()
-                liste_a_generer = [n for n in liste_enseignants_actifs
+                liste_a_generer = [n for n in noms_departement
                                    if normaliser_nom(n) not in exclus_admin]
 
                 reglages_admin_selections_groupe, reglages_admin_dates_groupe, reglages_admin_identites_groupe, _ = (
@@ -4240,8 +4319,8 @@ try:
                 seances_par_enseignant_groupe = {}
                 for nom_groupe in liste_a_generer:
                     nom_norm_groupe = normaliser_nom(nom_groupe)
-                    seances_groupe = df_edt[
-                        df_edt["Enseignants"].apply(
+                    seances_groupe = df_edt_complet[
+                        df_edt_complet["Enseignants"].apply(
                             lambda x: correspond_enseignant(x, nom_norm_groupe)
                         )
                     ].copy()
@@ -4269,7 +4348,7 @@ try:
                     )
 
                 buffer_groupe, nb_fiches = generer_excel_groupe(
-                    df_enseignants, df_edt, liste_a_generer, dict_noms_arabe_groupe,
+                    df_enseignants, df_edt_complet, liste_a_generer, dict_noms_arabe_groupe,
                     date_debut_cours, date_fin_comptabilisation, exclusions_par_mois,
                     selections_hsup_par_enseignant=selections_hsup_effectives,
                     exclusions_par_mois_par_enseignant=exclusions_par_enseignant_groupe,
@@ -4281,7 +4360,7 @@ try:
                 generation_type="Classeur groupé - tous les enseignants",
                 enseignants=liste_a_generer,
                 format_fichier="Excel multifeuille",
-                nom_fichier="Etats_HSUP_Tous_Enseignants_ELT_2026_2027.xlsx",
+                nom_fichier=f"Etats_HSUP_Tous_Enseignants_{departement_choisi}_2026_2027.xlsx",
                 statut="Succès",
                 message=f"{nb_fiches} fiche(s) H.SUP individuelle(s) générée(s).",
                 enseignants_details=details_groupe,
@@ -4289,10 +4368,10 @@ try:
             st.download_button(
                 label="📥 Télécharger toutes les fiches H.SUP (Excel multifeuille)",
                 data=buffer_groupe,
-                file_name="Etats_HSUP_Tous_Enseignants_ELT_2026_2027.xlsx",
+                file_name=f"Etats_HSUP_Tous_Enseignants_{departement_choisi}_2026_2027.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
-                key="download_hsup_groupe",
+                key=f"download_hsup_groupe_{departement_choisi}",
             )
 
         # ---- Historique des générations des états H.SUP ----

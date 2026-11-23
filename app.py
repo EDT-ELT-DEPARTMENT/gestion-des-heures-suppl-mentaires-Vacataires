@@ -388,9 +388,8 @@ def charger_donnees():
                          ", ".join(sorted(obligatoires - set(df_edt.columns))))
     for col in obligatoires:
         df_edt[col] = df_edt[col].fillna("").astype(str).str.strip()
-    if "Département" in df_edt.columns:
-        df_edt = df_edt[df_edt["Département"].str.strip().str.upper().eq("ELT")].copy()
-
+    # Aucun filtre par département : un enseignant du fichier du personnel qui intervient dans
+    # plusieurs départements garde toute sa charge dans les EDT et les états H.SUP.
     df_edt, _ = nettoyer_lignes_edt(df_edt)
     df_edt["JOUR_NORM"] = df_edt["Jours"].apply(normaliser_nom).str.lower()
 
@@ -3055,13 +3054,6 @@ def lire_date_compte(valeur, defaut):
 try:
     df_enseignants, df_edt, dict_noms_arabe, liste_enseignants_actifs = charger_donnees()
     df_edt_complet = charger_edt_complet()
-    # Seul le département ELT est traité (EDT, charges et états H.SUP).
-    if "Département" in df_edt_complet.columns:
-        _attrs_edt = dict(df_edt_complet.attrs)
-        df_edt_complet = df_edt_complet[
-            df_edt_complet["Département"].fillna("").astype(str).str.strip().str.upper().eq("ELT")
-        ].copy()
-        df_edt_complet.attrs.update(_attrs_edt)
     if df_edt_complet.attrs.get("lignes_ignorees"):
         st.caption(
             f"ℹ️ {df_edt_complet.attrs['lignes_ignorees']} ligne(s) vide(s) ou « Non défini » "
@@ -3415,7 +3407,7 @@ try:
             "Accès administrateur confirmé. Vous pouvez préparer les emplois du temps "
             "et les états H.SUP de l'ensemble des enseignants."
         )
-        # ---- Département ELT uniquement ; enseignants du fichier du personnel uniquement ----
+        # ---- Enseignants du fichier du personnel uniquement ; charge = toutes leurs séances ----
         departement_choisi = "ELT"
         inclure_autres_dept = False
         df_edt_complet_tous = df_edt_complet
@@ -3428,11 +3420,12 @@ try:
         nb_par_categorie = {"permanent": 0, "vacataire": 0}
         for n_dept in noms_departement:
             nb_par_categorie[categorie_enseignant(df_enseignants, normaliser_nom(n_dept))] += 1
-        st.subheader("🏛️ Département ELT")
+        st.subheader("🏛️ Enseignants du département ELT")
         st.caption(
-            f"Département ELT : {len(df_edt_dept)} séance(s) ; "
             f"{nb_par_categorie['permanent']} permanent(s) et {nb_par_categorie['vacataire']} vacataire(s) "
-            "du fichier du personnel ayant des séances."
+            "du fichier du personnel ayant des séances. Les enseignants qui interviennent dans "
+            "plusieurs départements gardent toute leur charge (tous départements) dans les EDT "
+            "et les états H.SUP."
         )
 
         st.subheader("📚 Téléchargement groupé de tous les enseignants")

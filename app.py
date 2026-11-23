@@ -547,6 +547,9 @@ def dedoublonner_seances_simultanees(seances):
     )
 
 
+SEPARATEUR_CRENEAU_HSUP = " ▸ "
+
+
 def _norm_creneau_hsup(texte):
     return re.sub(r"\s+", "", nettoyer_texte(texte)).casefold()
 

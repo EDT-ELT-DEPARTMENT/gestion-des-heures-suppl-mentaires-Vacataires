@@ -1711,8 +1711,8 @@ def _edt_lignes_case(seances_case, largeur_utile):
     return lignes
 
 
-EDT_COULEUR_HSUP = (1.0, 0.90, 0.45)              # fond des cases comptées en H.SUP
-EDT_COULEUR_CADRE_HSUP = (0.80, 0.22, 0.0)        # cadre et texte H.SUP
+EDT_COULEUR_HSUP = (0.90, 0.90, 0.90)              # gris clair des cases comptées en H.SUP
+EDT_COULEUR_CADRE_HSUP = (0.45, 0.45, 0.45)        # cadre et texte H.SUP
 
 
 def _edt_hsup_case(sc):
@@ -1845,7 +1845,7 @@ def _edt_dessiner_page(c, nom, qualite, seances, logo, page=1, pages=1):
                 cadres_hsup.append((xs[i + 1], y(haut + hauteur), xs[i + 2] - xs[i + 1], hauteur))
             lignes = contenus[i]
             c.setFillColorRGB(0, 0, 0)
-            c.setFont("Helvetica", EDT_TAILLE_CASE)
+            c.setFont("Helvetica-Bold" if est_hsup else "Helvetica", EDT_TAILLE_CASE)
             for k, ligne in enumerate(lignes):
                 base = centre + (k - (len(lignes) - 1) / 2) * EDT_INTERLIGNE + 0.3 * EDT_TAILLE_CASE
                 if est_hsup and ligne.startswith("H.SUP :"):
@@ -1855,6 +1855,7 @@ def _edt_dessiner_page(c, nom, qualite, seances, logo, page=1, pages=1):
                     c.setFillColorRGB(0, 0, 0)
                     c.setFont("Helvetica", EDT_TAILLE_CASE)
                 else:
+                    c.setFont("Helvetica-Bold" if est_hsup else "Helvetica", EDT_TAILLE_CASE)
                     c.drawString(xs[i + 1] + EDT_MARGE_CASE, y(base), ligne)
         haut += hauteur
 
@@ -1875,17 +1876,24 @@ def _edt_dessiner_page(c, nom, qualite, seances, logo, page=1, pages=1):
         c.setStrokeColorRGB(*EDT_COULEUR_CADRE_HSUP)
         c.setFillColorRGB(*EDT_COULEUR_HSUP)
         c.rect(EDT_TAB_X0, y(ly + 9), 16, 9, stroke=1, fill=1)
-        texte(EDT_TAB_X0 + 22, ly + 1, "Case encadrée = séance comptabilisée en H.SUP", "Helvetica-Bold", 8,
+        texte(EDT_TAB_X0 + 22, ly + 1, "Case gris clair et écriture en gras = séance H.SUP", "Helvetica-Bold", 8,
               EDT_COULEUR_CADRE_HSUP)
         c.setLineWidth(0.57)
         c.setStrokeColorRGB(*EDT_GRIS_BORD)
         c.setFillColorRGB(1, 1, 1)
         c.rect(EDT_TAB_X0 + 270, y(ly + 9), 16, 9, stroke=1, fill=1)
-        texte(EDT_TAB_X0 + 292, ly + 1, "Autre case = charge réglementaire (7 h équivalent-cours)", "Helvetica", 8,
+        texte(EDT_TAB_X0 + 292, ly + 1, "Case blanche = charge statutaire / autre séance", "Helvetica", 8,
               EDT_GRIS_TEXTE)
+        total_edt_phys = float(pd.to_numeric(dedoublonner_seances_simultanees(seances)["DUREE_H"], errors="coerce").fillna(0).sum()) if not seances.empty else 0.0
+        statutaire_phys = max(0.0, total_edt_phys - total_h)
+        fmt = lambda v: f"{v:.2f}".replace(".", ",")
         texte(EDT_TAB_X0, ly + 16,
-              f"Total H.SUP retenues : {total_h:.2f} h par semaine ({total_eq:.2f} h équivalent-cours)".replace("H.SUP", "H§SUP").replace(".", ",").replace("H§SUP", "H.SUP"),
-              "Helvetica-Bold", 9, EDT_COULEUR_CADRE_HSUP)
+              f"EDT plafonné : {fmt(total_edt_phys)} h physiques/semaine  |  H.SUP : {fmt(total_h)} h physiques ({fmt(total_eq)} h éq-cours)",
+              "Helvetica-Bold", 8)
+        if "permanent" in nettoyer_texte(qualite).casefold():
+            texte(EDT_TAB_X0, ly + 28,
+                  f"Charge statutaire de référence : 7,00 h équivalent-cours/semaine  |  Séances hors H.SUP dans l'EDT : {fmt(statutaire_phys)} h physiques",
+                  "Helvetica-Bold", 8, EDT_GRIS_TEXTE)
 
     # pied de page
     texte(793.2, 572.0, f"{page}/{pages}", "Helvetica-Oblique", 7, (0.502, 0.502, 0.502))
@@ -2543,6 +2551,46 @@ def limiter_charge_hebdo_vacataire(seances, plafond=PLAFOND_VACATAIRE_HEBDO):
         restant -= autorisee
     retenues = pd.DataFrame(lignes).drop(columns=["_JOUR_ORDRE", "_DEBUT_ORDRE"], errors="ignore")
     return retenues, total, float(plafond)
+
+
+def reconstituer_edt_complet_plafonne(seances_source, seances_retenues):
+    """Restaure toutes les matières d'un créneau retenu, sans recompter le créneau."""
+    if seances_retenues is None or seances_retenues.empty:
+        return seances_source.iloc[0:0].copy()
+    if len(seances_retenues) == len(seances_source) and not seances_retenues.get(
+        "DUREE_H_INITIALE", pd.Series(dtype=float)
+    ).notna().any():
+        return seances_source.copy()
+
+    cles_retenues = {}
+    for _, ligne in seances_retenues.iterrows():
+        cle = cle_horaire_enseignement(ligne)
+        cles_retenues[cle] = (
+            float(ligne.get("DUREE_H", 0) or 0),
+            float(ligne.get("DUREE_H_INITIALE", ligne.get("DUREE_H", 0)) or 0),
+        )
+
+    lignes = []
+    for _, ligne in seances_source.iterrows():
+        cle = cle_horaire_enseignement(ligne)
+        if cle not in cles_retenues:
+            continue
+        copie = ligne.copy()
+        duree_retenue, duree_initiale = cles_retenues[cle]
+        copie["DUREE_H_INITIALE"] = duree_initiale
+        copie["DUREE_H"] = duree_retenue
+        if duree_retenue < duree_initiale - 1e-9:
+            horaire = nettoyer_texte(copie.get("Horaire", "")).replace("–", "-").replace("—", "-")
+            morceaux = re.split(r"\s*-\s*", horaire)
+            if len(morceaux) == 2:
+                try:
+                    debut = lire_heure(morceaux[0])
+                    fin = debut + int(round(duree_retenue * 60))
+                    copie["Horaire"] = f"{_edt_libelle_heure(debut)} - {_edt_libelle_heure(fin)}"
+                except ValueError:
+                    pass
+        lignes.append(copie)
+    return pd.DataFrame(lignes) if lignes else seances_source.iloc[0:0].copy()
 
 
 def simuler_suppression_vacataire(seances_toutes, labels_supprimes):
@@ -4026,12 +4074,20 @@ try:
                             )
 
 
+            # Variables initialisées à chaque affichage de la catégorie, même
+            # lorsque le bouton de génération n'est pas pressé.
+            liste_edt_plafonnes_hsup_excel = []
+            plafonnes_edt_hsup_excel = []
+            generation_hsup_declenchee = False
+            cle_edt_plafonne = cle_pret + "_edt_plafonne"
+
             if st.button(
                 f"🗓️ Préparer les états H.SUP Excel — {titre_cat}",
                 use_container_width=True,
                 disabled=not selection_hsup_excel,
                 key=f"hsup_excel_preparer_{categorie}_{departement_choisi}",
             ):
+                generation_hsup_declenchee = True
                 with st.spinner("Génération des états H.SUP Excel..."):
 
                     preferences_admin_hsup_excel, exclus_admin_hsup_excel, erreur_preferences_hsup_excel = (
@@ -4065,8 +4121,10 @@ try:
                                 }
 
                         liste_hsup_excel = []
+                        liste_edt_plafonnes_hsup_excel = []
                         seances_par_enseignant_hsup_excel = {}
                         plafonnes_vacataires = []
+                        plafonnes_edt_hsup_excel = []
 
                         for nom_hsup_excel in selection_hsup_excel:
                             nom_norm_hsup_excel = normaliser_nom(nom_hsup_excel)
@@ -4095,6 +4153,7 @@ try:
                             if seances_hsup_excel.empty:
                                 continue
 
+                            enseignements_retenus_hsup_excel = []
                             if "permanent" in qualite_hsup_excel.casefold():
                                 enseignements_retenus_hsup_excel = (
                                     preferences_admin_hsup_excel.get(
@@ -4131,20 +4190,55 @@ try:
                                 if total_vac_avant > PLAFOND_VACATAIRE_HEBDO + 1e-9:
                                     plafonnes_vacataires.append(f"{nom_hsup_excel} ({total_vac_avant:.2f} h)")
 
-                            if seances_pour_etat_hsup_excel.empty:
-                                continue
+                            # L'état H.SUP n'est ajouté que si des heures sont retenues.
+                            # L'EDT global plafonné sera néanmoins généré même sans H.SUP,
+                            # afin que le permanent reçoive aussi sa charge statutaire.
+                            if not seances_pour_etat_hsup_excel.empty:
+                                seances_par_enseignant_hsup_excel[nom_norm_hsup_excel] = (
+                                    seances_pour_etat_hsup_excel
+                                )
+                                liste_hsup_excel.append(
+                                    (
+                                        nom_hsup_excel,
+                                        qualite_hsup_excel,
+                                        seances_pour_etat_hsup_excel,
+                                    )
+                                )
 
-                            seances_par_enseignant_hsup_excel[nom_norm_hsup_excel] = (
-                                seances_pour_etat_hsup_excel
-                            )
-
-                            liste_hsup_excel.append(
-                                (
-                                    nom_hsup_excel,
-                                    qualite_hsup_excel,
-                                    seances_pour_etat_hsup_excel,
+                            # L'EDT remis à l'enseignant est son EDT COMPLET, plafonné
+                            # à 12 heures physiques hebdomadaires, indépendamment des
+                            # seules séances retenues pour le calcul H.SUP des permanents.
+                            edt_plafonne, charge_edt_avant, charge_edt_apres = (
+                                limiter_charge_hebdo_vacataire(
+                                    seances_hsup_excel,
+                                    plafond=PLAFOND_VACATAIRE_HEBDO,
                                 )
                             )
+                            edt_plafonne = reconstituer_edt_complet_plafonne(seances_hsup_excel, edt_plafonne)
+                            # Le PDF montre l'EDT GLOBAL conservé (statutaire + H.SUP).
+                            # Pour un permanent, les seules portions réellement comptées en H.SUP
+                            # sont marquées après plafonnement : fond gris clair et texte gras.
+                            if not edt_plafonne.empty:
+                                if "permanent" in qualite_hsup_excel.casefold():
+                                    selections_marquees = enseignements_retenus_hsup_excel or sorted({
+                                        nettoyer_texte(x) for x in edt_plafonne.get("Enseignements", [])
+                                        if nettoyer_texte(x)
+                                    })
+                                    edt_plafonne = marquer_hsup_seances(edt_plafonne, selections_marquees)
+                                else:
+                                    # Pour un vacataire, les séances retenues constituent les heures rémunérées.
+                                    edt_plafonne = edt_plafonne.copy()
+                                    edt_plafonne["_HSUP_H"] = pd.to_numeric(edt_plafonne["DUREE_H"], errors="coerce").fillna(0)
+                                    edt_plafonne["_HSUP_INIT"] = pd.to_numeric(edt_plafonne.get("DUREE_H_INITIALE", edt_plafonne["DUREE_H"]), errors="coerce").fillna(0)
+                                    edt_plafonne["_HSUP_EQ"] = edt_plafonne["_HSUP_H"]
+                            if charge_edt_avant > PLAFOND_VACATAIRE_HEBDO + 1e-9:
+                                plafonnes_edt_hsup_excel.append(
+                                    f"{nom_hsup_excel} ({charge_edt_avant:.2f} h → {charge_edt_apres:.2f} h)"
+                                )
+                            if not edt_plafonne.empty:
+                                liste_edt_plafonnes_hsup_excel.append(
+                                    (nom_hsup_excel, qualite_hsup_excel, edt_plafonne)
+                                )
 
                         if plafonnes_vacataires:
                             st.warning(
@@ -4325,6 +4419,29 @@ try:
                                 enseignants_details=details_hsup_excel,
                             )
 
+            # Génération automatique de l'EDT individuel plafonné, uniquement
+            # au moment où l'administrateur lance une nouvelle génération H.SUP.
+            if generation_hsup_declenchee:
+                if liste_edt_plafonnes_hsup_excel:
+                    try:
+                        pdf_edt_plafonne = generer_pdf_edt(liste_edt_plafonnes_hsup_excel)
+                        st.session_state[cle_edt_plafonne] = {
+                            "data": pdf_edt_plafonne.getvalue(),
+                            "nom": f"EDT_plafonnes_12h_{libelle_cat}_{departement_choisi}_2026_2027.pdf",
+                            "ordre": [e[0] for e in liste_edt_plafonnes_hsup_excel],
+                        }
+                    except Exception as exc_edt_plafonne:
+                        st.session_state.pop(cle_edt_plafonne, None)
+                        st.error(f"Les états H.SUP sont générés, mais l'EDT plafonné PDF n'a pas pu être créé : {exc_edt_plafonne}")
+                else:
+                    st.session_state.pop(cle_edt_plafonne, None)
+
+            if plafonnes_edt_hsup_excel:
+                st.info(
+                    "EDT plafonné automatiquement à 12 h/semaine : "
+                    + ", ".join(plafonnes_edt_hsup_excel)
+                )
+
             pret_hsup_excel = st.session_state.get(cle_pret)
 
             if pret_hsup_excel:
@@ -4341,6 +4458,18 @@ try:
                     mime=pret_hsup_excel["mime"],
                     use_container_width=True,
                     key=f"download_hsup_excel_selection_{categorie}_{departement_choisi}",
+                )
+            # Le bouton EDT est indépendant de la présence d'un état H.SUP :
+            # un permanent sans dépassement reçoit tout de même son EDT statutaire.
+            pret_edt_plafonne = st.session_state.get(cle_edt_plafonne)
+            if pret_edt_plafonne:
+                st.download_button(
+                    label=f"📥 Télécharger les EDT globaux plafonnés à 12 h ({pret_edt_plafonne['nom']})",
+                    data=pret_edt_plafonne["data"],
+                    file_name=pret_edt_plafonne["nom"],
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key=f"download_edt_plafonne_hsup_{categorie}_{departement_choisi}",
                 )
 
         if st.button("📦 Générer le classeur Excel de tous les enseignants",
